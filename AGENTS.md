@@ -55,8 +55,15 @@ share/cash-register.wav      CC0, see share/ATTRIBUTION.md
 
 `rtc statusline` is what `statusLine.command` runs. `rtc hook`, `halt`, `setup`, `uninstall`,
 `doctor` are the rest. `doctor` exists to answer "why is it quiet" without a debugging session —
-extend it when you add a way for things to be quiet. Three ring modes are three such ways, which is
-why each prints its own line there.
+extend it when you add a way for things to be quiet. Every ring mode is one such way, and so is a
+shared ring, which is why each prints its own line there.
+
+**Nothing counts sessions by counting files.** Nothing ever deletes a state file — it lives until
+`$XDG_RUNTIME_DIR` is cleared at logout — so a glob counts every session the machine has run since
+then. `doctor` was reporting 27 sessions and a third of a core against three live ones, and telling
+the user to raise `refreshInterval` on the strength of it. A live session rewrites its state on every
+render, so liveness is recency: `find "$RUN" -maxdepth 1 -name 'rtc-*.state' -mmin -1`. Use `-mmin`
+rather than `-newermt`, which is a GNU spelling that silently returns nothing under `bfs`.
 
 ## Runtime state
 

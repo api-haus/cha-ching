@@ -647,8 +647,17 @@ cmd_uninstall() {
 }
 
 # ── doctor ────────────────────────────────────────────────────────────────────
+# Which sessions are actually open. Nothing deletes a state file — it lives
+# until $XDG_RUNTIME_DIR is cleared at logout — so counting the files counts
+# every session this machine has run since then, and doctor was reporting a
+# third of a core against three live sessions and two dozen dead ones. A live
+# session rewrites its state on every render, so recency is what live means.
+# `-mmin` rather than `-newermt`: both GNU and BSD find have it, and the minute
+# is generous against a one-second refreshInterval.
+live_states() { find "$RUN" -maxdepth 1 -name 'rtc-*.state' -mmin -1 2>/dev/null; }
+
 cmd_doctor() {
-  local ok p found wired
+  local ok stale p found wired
   printf 'rtc doctor\n\n'
 
   if command -v jq >/dev/null 2>&1; then printf '  jq          %s\n' "$(command -v jq)"
@@ -721,11 +730,19 @@ cmd_doctor() {
 
   [ -n "${RTC_CHAIN:-}" ] && printf '  chain       %s\n' "$RTC_CHAIN"
 
-  ok=$(ls "$RUN"/rtc-*.state 2>/dev/null | wc -l)
-  printf '  live data   %s session(s) reporting\n' "$ok"
+  ok=$(live_states | wc -l); ok=$((ok))
+  stale=$(ls "$RUN"/rtc-*.state 2>/dev/null | wc -l); stale=$(( stale - ok ))
+  printf '  live data   %s session(s) rendering now\n' "$ok"
+  if [ "$stale" -gt 0 ]; then
+    printf '              %s state file(s) left behind by sessions that have ended. They cost\n' "$stale"
+    printf '              nothing and go at logout with %s; to clear them now:\n' "$RUN"
+    printf '                find %s -maxdepth 1 -name '\''rtc-*'\'' ! -name '\''*.ring'\'' -mmin +60 -delete\n' "$RUN"
+  fi
 
   # refreshInterval 1 re-runs this for every open session, every second. That is
-  # cheap once and not cheap two dozen times, so show the arithmetic.
+  # cheap once and not cheap two dozen times, so show the arithmetic — over the
+  # sessions actually rendering, which is the whole reason the count above is
+  # measured rather than globbed.
   if [ "$ok" -gt 0 ]; then
     printf '  render cost ~%dms each; %s session(s) at refreshInterval %s ≈ %s%% of a core\n' \
       10 "$ok" "$(jq -r '.statusLine.refreshInterval // 1' "$SETTINGS" 2>/dev/null)" \
@@ -740,19 +757,24 @@ cmd_doctor() {
   if [ "$ESTIMATE" = "0" ]; then
     printf '  estimate    off\n'
   else
-    local f n any=0
-    for f in "$RUN"/rtc-*.turns; do
+    # Driven off the state files rather than the turn files, because a session
+    # rewrites its state every render but its turns only when a request lands —
+    # so recency on the turns would hide a live session that has been reading
+    # for a minute.
+    local f n sess any=0
+    while read -r f; do
+      sess=${f##*/rtc-}; sess=${sess%.state}
+      f="$RUN/rtc-$sess.turns"
       [ -r "$f" ] || continue
-      n=$(wc -l < "$f")
+      n=$(wc -l < "$f"); n=$((n))
       [ "$n" -gt 0 ] || continue
       any=1
-      f=${f##*/rtc-}; f=${f%.turns}
       if [ "$n" -lt 3 ]; then
-        printf '  estimate    %.8s — %s turn(s), showing a provisional figure (dim until 3)\n' "$f" "$n"
+        printf '  estimate    %.8s — %s turn(s), showing a provisional figure (dim until 3)\n' "$sess" "$n"
       else
-        printf '  estimate    %.8s — %s turn(s), calibrated\n' "$f" "$n"
+        printf '  estimate    %.8s — %s turn(s), calibrated\n' "$sess" "$n"
       fi
-    done
+    done < <(live_states)
     local rf
     for rf in "$CACHE_DIR"/rate-*; do
       [ -r "$rf" ] || continue
@@ -762,6 +784,9 @@ cmd_doctor() {
     done
     [ "$any" = 0 ] && printf '  estimate    no completed turns recorded yet — send a message and it calibrates\n'
   fi
+  # A diagnostic that reports everything is fine and then exits 1 breaks any
+  # && chain it is put in. The last test above decides the status otherwise.
+  return 0
 }
 
 case "${1:-statusline}" in
