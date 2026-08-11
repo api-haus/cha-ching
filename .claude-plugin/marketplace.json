@@ -1,15 +1,15 @@
 {
-  "name": "cha-ching",
-  "description": "A spend ticker and context gauge for Claude Code that composes with the statusline you already run.",
-  "version": "1.4.0",
+  "name": "realtokencost",
+  "description": "What the context in front of you actually costs, before you press enter.",
+  "version": "2.0.0",
   "owner": {
     "name": "api-haus"
   },
   "plugins": [
     {
-      "name": "cha-ching",
+      "name": "realtokencost",
       "source": "./",
-      "description": "Rings a cash register when money moves, floats a fading +$0.42 in the statusline, and warns as the context window fills. Chains to ccstatusline or any other statusline instead of replacing it."
+      "description": "Shows the cost of submitting your current context before you send it, and whether the prompt cache is still alive. Chains to any existing statusline."
     }
   ]
 }

@@ -5,7 +5,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"${CLAUDE_PLUGIN_ROOT}\"/bin/cha-ching hook"
+            "command": "\"${CLAUDE_PLUGIN_ROOT}\"/bin/rtc hook"
           }
         ]
       }

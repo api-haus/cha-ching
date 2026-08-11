@@ -1,5 +1,10 @@
 #!/usr/bin/env bash
-# cha-ching — hear what Claude Code costs you, and watch the context fill.
+# realtokencost (rtc) — what the context in front of you actually costs.
+#
+# The window is re-sent on every request, so the price of a message is set by the
+# conversation you are carrying rather than by the question you are asking. This
+# shows that price before you press enter, and whether the prompt cache is still
+# alive — a lapsed one rewrites the whole window at twenty times the read rate.
 #
 # Claude Code hands cost and context-window figures to the statusline and to
 # nothing else. Hook payloads carry neither, and the request to expose context
@@ -7,11 +12,11 @@
 # harvests both, and hands the payload straight on to whatever statusline you
 # already run.
 #
-#   cha-ching statusline   harvest, render, chain   (what statusLine.command runs)
-#   cha-ching hook         context band warnings    (wired by the plugin)
-#   cha-ching setup        claim the statusLine slot, keeping what was there
-#   cha-ching uninstall    give it back
-#   cha-ching doctor       explain why it is quiet
+#   rtc statusline   harvest, render, chain   (what statusLine.command runs)
+#   rtc hook         context band warnings    (wired by the plugin)
+#   rtc setup        claim the statusLine slot, keeping what was there
+#   rtc uninstall    give it back
+#   rtc doctor       explain why it is quiet
 set -u
 
 # Money and percentages are text all the way through here. Under a comma-decimal
@@ -23,7 +28,7 @@ SELF=$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")
 HERE=$(dirname "$SELF")
 ROOT=$(dirname "$HERE")
 RUN=${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}
-CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/cha-ching"
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/realtokencost"
 CONFIG="$CONFIG_DIR/config"
 SETTINGS="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json"
 
@@ -33,7 +38,7 @@ SETTINGS="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json"
 if [ -r "$CONFIG" ]; then
   while IFS='=' read -r key value; do
     case "$key" in
-      CHA_CHING_*)
+      RTC_*)
         value=${value%\"}; value=${value#\"}
         [ -z "${!key:-}" ] && export "$key=$value"
         ;;
@@ -41,12 +46,12 @@ if [ -r "$CONFIG" ]; then
   done < "$CONFIG"
 fi
 
-FADE=${CHA_CHING_FADE:-4}          # seconds for the floating number to die
-COOLDOWN=${CHA_CHING_COOLDOWN:-3}  # seconds between rings; spend in between accrues
-MIN=${CHA_CHING_MIN:-0.005}        # spend below this is not worth a sound
-BANDS=${CHA_CHING_BANDS:-10}       # announce context every N percent
-ESTIMATE=${CHA_CHING_ESTIMATE:-1}  # 0 hides the [~$0.42] next-message estimate
-SAMPLES=${CHA_CHING_SAMPLES:-6}    # completed turns kept to calibrate the estimate
+FADE=${RTC_FADE:-4}          # seconds for the floating number to die
+COOLDOWN=${RTC_COOLDOWN:-3}  # seconds between rings; spend in between accrues
+MIN=${RTC_MIN:-0.005}        # spend below this is not worth a sound
+BANDS=${RTC_BANDS:-10}       # announce context every N percent
+ESTIMATE=${RTC_ESTIMATE:-1}  # 0 hides the [~$0.42] next-message estimate
+SAMPLES=${RTC_SAMPLES:-6}    # completed turns kept to calibrate the estimate
 
 die() { printf '%s\n' "$*" >&2; exit 1; }
 now_s() { date +%s.%N 2>/dev/null || date +%s; }
@@ -74,7 +79,7 @@ cmd_statusline() {
 
   local now state last pending ring_ts shown shown_ts prev_prompt turn_cost turn_ctx last_call ttl ring=0
   now=$(now_s)
-  state="$RUN/cha-ching-${session:-nosession}.state"
+  state="$RUN/rtc-${session:-nosession}.state"
 
   last=""; pending=0; ring_ts=0; shown=0; shown_ts=0; prev_prompt="-"; turn_cost=""; turn_ctx=0
   last_call=0; ttl=0
@@ -119,12 +124,12 @@ cmd_statusline() {
       [ "${cwrite:-0}" -gt "${cread:-0}" ] && bucket=rebuilds
       awk -v c0="$turn_cost" -v c1="$cost" -v ctx="$turn_ctx" \
         'BEGIN { d = c1 - c0; if (d > 0) printf "%.6f\n", d / (ctx / 1000000) }' \
-        >> "$RUN/cha-ching-${session:-nosession}.$bucket" 2>/dev/null || true
+        >> "$RUN/rtc-${session:-nosession}.$bucket" 2>/dev/null || true
       # Keep only recent turns: a session's shape changes as the work changes.
-      tail -n "$SAMPLES" "$RUN/cha-ching-${session:-nosession}.$bucket" \
-        > "$RUN/cha-ching-${session:-nosession}.$bucket.tmp" 2>/dev/null &&
-        mv -f "$RUN/cha-ching-${session:-nosession}.$bucket.tmp" \
-              "$RUN/cha-ching-${session:-nosession}.$bucket" 2>/dev/null || true
+      tail -n "$SAMPLES" "$RUN/rtc-${session:-nosession}.$bucket" \
+        > "$RUN/rtc-${session:-nosession}.$bucket.tmp" 2>/dev/null &&
+        mv -f "$RUN/rtc-${session:-nosession}.$bucket.tmp" \
+              "$RUN/rtc-${session:-nosession}.$bucket" 2>/dev/null || true
     fi
     prev_prompt=$prompt
     turn_cost=$cost
@@ -139,19 +144,19 @@ cmd_statusline() {
     > "$state.tmp" 2>/dev/null && mv -f "$state.tmp" "$state" 2>/dev/null || true
 
   # Context, parked where the band hook can read it.
-  printf '%s %s\n' "$used" "$size" > "$RUN/cha-ching-${session:-nosession}.ctx" 2>/dev/null || true
+  printf '%s %s\n' "$used" "$size" > "$RUN/rtc-${session:-nosession}.ctx" 2>/dev/null || true
 
   [ "$ring" = 1 ] && play_sound
 
   local segment="" chain=""
-  if [ "${CHA_CHING_SEGMENT:-1}" != "0" ]; then
+  if [ "${RTC_SEGMENT:-1}" != "0" ]; then
     # A render is three processes and the statusline re-runs every second for
     # every open session — measured at 38% of a core across two dozen of them.
     # Most of those renders have nothing new to say, so the line is cached and
     # only rebuilt when something it depends on moves. A fade in progress
     # changes the line every frame and is never cached.
     local cache key fading=0 age fade_int=${FADE%.*} minute=0
-    cache="$RUN/cha-ching-${session:-nosession}.line"
+    cache="$RUN/rtc-${session:-nosession}.line"
     # The cache clock moves on its own, so the key carries a minute counter —
     # otherwise a window could go cold behind a cached line that still claims it
     # is warm. One extra render a minute, not one a second.
@@ -181,8 +186,8 @@ cmd_statusline() {
     fi
   fi
 
-  if [ -n "${CHA_CHING_CHAIN:-}" ]; then
-    chain=$(printf '%s' "$payload" | eval "${CHA_CHING_CHAIN}" 2>/dev/null)
+  if [ -n "${RTC_CHAIN:-}" ]; then
+    chain=$(printf '%s' "$payload" | eval "${RTC_CHAIN}" 2>/dev/null)
   fi
 
   if [ -n "$segment" ] && [ -n "$chain" ]; then
@@ -233,7 +238,7 @@ detect_ttl() {
 # has suffered one, and otherwise from the write/read price ratio.
 estimate() {
   local sess="$1" ctx="$2" last_call="$3" ttl="$4" now="$5"
-  local turns="$RUN/cha-ching-$sess.turns" cold="$RUN/cha-ching-$sess.rebuilds"
+  local turns="$RUN/rtc-$sess.turns" cold="$RUN/rtc-$sess.rebuilds"
   [ -r "$turns" ] || return 1
   [ "${ctx:-0}" -gt 0 ] || return 1
   awk -v ctx="$ctx" -v coldf="$cold" -v lc="$last_call" -v ttl="$ttl" -v now="$now" '
@@ -314,9 +319,9 @@ render() {
 }
 
 play_sound() {
-  [ "${CHA_CHING_MUTE:-0}" = "1" ] && return 0
+  [ "${RTC_MUTE:-0}" = "1" ] && return 0
   local wav p
-  wav=${CHA_CHING_SOUND:-$ROOT/share/ca-ching.wav}
+  wav=${RTC_SOUND:-$ROOT/share/cash-register.wav}
   [ -s "$wav" ] || return 0
   for p in pw-play paplay aplay afplay; do
     if command -v "$p" >/dev/null 2>&1; then
@@ -334,15 +339,15 @@ cmd_hook() {
   session=$(printf '%s' "$payload" | jq -r '.session_id // empty' 2>/dev/null)
   [ -n "$session" ] || exit 0
 
-  ctx="$RUN/cha-ching-${session}.ctx"
+  ctx="$RUN/rtc-${session}.ctx"
   if [ ! -r "$ctx" ]; then
     # Installed but never set up. The hooks wire themselves and the statusline
     # cannot, so this is the one failure mode a new user will actually hit —
     # say it once rather than sitting there silently doing nothing.
-    local nudge="$RUN/cha-ching-${session}.nudged"
-    if [ ! -e "$nudge" ] && ! jq -e '.statusLine.command // "" | test("cha-ching")' "$SETTINGS" >/dev/null 2>&1; then
+    local nudge="$RUN/rtc-${session}.nudged"
+    if [ ! -e "$nudge" ] && ! jq -e '.statusLine.command // "" | test("realtokencost")' "$SETTINGS" >/dev/null 2>&1; then
       : > "$nudge" 2>/dev/null || true
-      jq -n '{systemMessage: "cha-ching is installed but not wired to the statusline, which is the only place Claude Code exposes cost and context. Run /cha-ching:setup"}'
+      jq -n '{systemMessage: "realtokencost is installed but not wired to the statusline, which is the only place Claude Code exposes cost and context. Run /realtokencost:setup"}'
     fi
     exit 0
   fi
@@ -353,7 +358,7 @@ cmd_hook() {
   band=$(( used * 100 / size / BANDS ))
   [ "$band" -ge 1 ] || exit 0
 
-  state="$RUN/cha-ching-${session}.band"
+  state="$RUN/rtc-${session}.band"
   last=0
   [ -r "$state" ] && last=$(cat "$state" 2>/dev/null)
   case "$last" in ''|*[!0-9]*) last=0 ;; esac
@@ -368,26 +373,26 @@ human() { awk -v n="$1" 'BEGIN { printf (n >= 1000000 ? "%.2fM" : "%.0fk"), n / 
 
 # ── setup ─────────────────────────────────────────────────────────────────────
 cmd_setup() {
-  command -v jq >/dev/null 2>&1 || die "cha-ching needs jq."
+  command -v jq >/dev/null 2>&1 || die "realtokencost needs jq."
   [ -f "$SETTINGS" ] || die "no settings.json at $SETTINGS"
 
   local current backup tmp
   current=$(jq -r '.statusLine.command // empty' "$SETTINGS")
 
   # Never chain to ourselves. Re-running setup, or moving from a checkout to an
-  # installed copy, would otherwise wire cha-ching into its own chain and render
+  # installed copy, would otherwise wire realtokencost into its own chain and render
   # the gauge twice — with the second copy fighting the first over the state file.
-  if [ -n "$current" ] && [ "$current" != "$SELF" ] && ! printf '%s' "$current" | grep -q 'cha-ching'; then
+  if [ -n "$current" ] && [ "$current" != "$SELF" ] && ! printf '%s' "$current" | grep -q 'realtokencost'; then
     mkdir -p "$CONFIG_DIR"
-    if grep -q '^CHA_CHING_CHAIN=' "$CONFIG" 2>/dev/null; then
+    if grep -q '^RTC_CHAIN=' "$CONFIG" 2>/dev/null; then
       printf 'keeping the chain already in %s\n' "$CONFIG"
     else
-      printf 'CHA_CHING_CHAIN=%s\n' "$current" >> "$CONFIG"
+      printf 'RTC_CHAIN=%s\n' "$current" >> "$CONFIG"
       printf 'chaining to your existing statusline: %s\n' "$current"
     fi
   fi
 
-  backup="$SETTINGS.cha-ching.bak"
+  backup="$SETTINGS.realtokencost.bak"
   cp "$SETTINGS" "$backup"
   tmp=$(mktemp)
   jq --arg cmd "$SELF" \
@@ -401,7 +406,7 @@ cmd_setup() {
 
 cmd_uninstall() {
   local chain tmp
-  chain=$(sed -n 's/^CHA_CHING_CHAIN=//p' "$CONFIG" 2>/dev/null | head -1)
+  chain=$(sed -n 's/^RTC_CHAIN=//p' "$CONFIG" 2>/dev/null | head -1)
   tmp=$(mktemp)
   if [ -n "$chain" ]; then
     jq --arg cmd "$chain" '.statusLine = {"type":"command","command":$cmd}' "$SETTINGS" > "$tmp"
@@ -417,7 +422,7 @@ cmd_uninstall() {
 # ── doctor ────────────────────────────────────────────────────────────────────
 cmd_doctor() {
   local ok p found wired
-  printf 'cha-ching doctor\n\n'
+  printf 'rtc doctor\n\n'
 
   if command -v jq >/dev/null 2>&1; then printf '  jq          %s\n' "$(command -v jq)"
   else printf '  jq          MISSING — nothing works without it\n'; fi
@@ -429,20 +434,20 @@ cmd_doctor() {
   if [ -n "$found" ]; then printf '  player      %s\n' "$found"
   else printf '  player      none of pw-play/paplay/aplay/afplay — it will be silent\n'; fi
 
-  if [ -s "$ROOT/share/ca-ching.wav" ]; then printf '  sound       %s\n' "$ROOT/share/ca-ching.wav"
-  else printf '  sound       MISSING at %s\n' "$ROOT/share/ca-ching.wav"; fi
+  if [ -s "$ROOT/share/cash-register.wav" ]; then printf '  sound       %s\n' "$ROOT/share/cash-register.wav"
+  else printf '  sound       MISSING at %s\n' "$ROOT/share/cash-register.wav"; fi
 
   wired=$(jq -r '.statusLine.command // "none"' "$SETTINGS" 2>/dev/null)
   if [ "$wired" = "$SELF" ]; then
     printf '  statusLine  wired (refreshInterval %s)\n' "$(jq -r '.statusLine.refreshInterval // "unset"' "$SETTINGS")"
   else
     printf '  statusLine  NOT wired — currently %s\n' "$wired"
-    printf '              run: cha-ching setup\n'
+    printf '              run: rtc setup\n'
   fi
 
-  [ -n "${CHA_CHING_CHAIN:-}" ] && printf '  chain       %s\n' "$CHA_CHING_CHAIN"
+  [ -n "${RTC_CHAIN:-}" ] && printf '  chain       %s\n' "$RTC_CHAIN"
 
-  ok=$(ls "$RUN"/cha-ching-*.state 2>/dev/null | wc -l)
+  ok=$(ls "$RUN"/rtc-*.state 2>/dev/null | wc -l)
   printf '  live data   %s session(s) reporting\n' "$ok"
 
   # refreshInterval 1 re-runs this for every open session, every second. That is
@@ -462,12 +467,12 @@ cmd_doctor() {
     printf '  estimate    off\n'
   else
     local f n any=0
-    for f in "$RUN"/cha-ching-*.turns; do
+    for f in "$RUN"/rtc-*.turns; do
       [ -r "$f" ] || continue
       n=$(wc -l < "$f")
       [ "$n" -gt 0 ] || continue
       any=1
-      f=${f##*/cha-ching-}; f=${f%.turns}
+      f=${f##*/rtc-}; f=${f%.turns}
       if [ "$n" -lt 3 ]; then
         printf '  estimate    %.8s — %s turn(s), showing a provisional figure (dim until 3)\n' "$f" "$n"
       else

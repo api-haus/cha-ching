@@ -1,16 +1,16 @@
 ---
-allowed-tools: Bash(*/bin/cha-ching setup), Bash(*/bin/cha-ching doctor)
-description: Claim the statusLine slot for cha-ching, keeping any statusline already there
+allowed-tools: Bash(*/bin/rtc setup), Bash(*/bin/rtc doctor)
+description: Claim the statusLine slot for realtokencost, keeping any statusline already there
 disable-model-invocation: false
 ---
 
-Run the cha-ching setup script:
+Run the rtc setup script:
 
-!`"${CLAUDE_PLUGIN_ROOT}"/bin/cha-ching setup`
+!`"${CLAUDE_PLUGIN_ROOT}"/bin/rtc setup`
 
 Then run the doctor to confirm the result:
 
-!`"${CLAUDE_PLUGIN_ROOT}"/bin/cha-ching doctor`
+!`"${CLAUDE_PLUGIN_ROOT}"/bin/rtc doctor`
 
 Report what the two commands printed. If a previous statusline was found it is now chained rather
 than replaced, so say which one. Tell the user to restart Claude Code, since `statusLine` is read at

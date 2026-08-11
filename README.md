@@ -1,6 +1,8 @@
-# cha-ching
+# realtokencost
 
-Hear what Claude Code costs you, and watch the context fill.
+**What the context in front of you actually costs — before you press enter.**
+
+A Claude Code statusline segment and hook. `rtc` for short.
 
 ```
 Opus 5  xhigh  █░░░░░░░░░ 18%  182k / 1.00M  $9.76  [~$0.18]  +$0.03
@@ -38,15 +40,15 @@ the expensive part already happened.
 ## Install
 
 ```bash
-claude plugin marketplace add api-haus/cha-ching
-claude plugin install cha-ching@cha-ching
+claude plugin marketplace add api-haus/realtokencost
+claude plugin install realtokencost@realtokencost
 ```
 
 The hooks wire themselves. The statusline needs one more step, because **no plugin can register a
 statusline** — `statusLine` is a settings key with no plugin path. Run:
 
 ```
-/cha-ching:setup
+/realtokencost:setup
 ```
 
 That claims the `statusLine` slot, sets `refreshInterval: 1` so the floating number can fade, and —
@@ -56,14 +58,14 @@ Code afterwards; `statusLine` is read at startup.
 To do it by hand instead, or to undo it:
 
 ```bash
-CC=$(ls -d ~/.claude/plugins/cache/cha-ching/cha-ching/*/ | sort -V | tail -1)bin/cha-ching
+CC=$(ls -d ~/.claude/plugins/cache/realtokencost/realtokencost/*/ | sort -V | tail -1)bin/rtc
 "$CC" setup       # claim the slot, chaining whatever was there
 "$CC" doctor      # explain why it is quiet
 "$CC" uninstall   # give the slot back
 ```
 
 Installed plugins live under a version directory and old versions are kept, so the path is
-`~/.claude/plugins/cache/cha-ching/cha-ching/<version>/bin/cha-ching` — hence picking the highest.
+`~/.claude/plugins/cache/realtokencost/realtokencost/<version>/bin/rtc` — hence picking the highest.
 
 ## It composes
 
@@ -72,38 +74,38 @@ Every statusline in this space is a total replacement: [ccstatusline](https://gi
 [ClaudeCodeStatusLine](https://github.com/daniel3303/ClaudeCodeStatusLine) and the rest all want the
 one slot, so you pick one and lose the others.
 
-cha-ching chains instead. It reads the payload, harvests what it needs, then hands the same payload
+RTC chains instead. It reads the payload, harvests what it needs, then hands the same payload
 to your statusline and prints what that prints:
 
 ```
-statusLine.command → cha-ching ──harvest──→ bridge ──→ hooks
+statusLine.command → realtokencost ──harvest──→ bridge ──→ hooks
                           │                              │
                           └──payload──→ ccstatusline     └─→ context warnings
                                              │
                                            output ──→ appended to ours
 ```
 
-Set `CHA_CHING_SEGMENT=0` and it renders nothing of its own — pure plumbing that adds a ring and a
+Set `RTC_SEGMENT=0` and RTC renders nothing of its own — pure plumbing that adds a ring and a
 floating number to a statusline you already like.
 
 ## Configuration
 
-`~/.config/cha-ching/config`, one `KEY=value` per line. A real environment variable wins over the
+`~/.config/realtokencost/config`, one `KEY=value` per line. A real environment variable wins over the
 file, because hooks and the statusline are launched by Claude Code and need not have inherited your
 shell.
 
 | Key | Default | |
 |---|---|---|
-| `CHA_CHING_CHAIN` | — | your statusline command; gets the same payload, output appended |
-| `CHA_CHING_SEGMENT` | `1` | `0` renders nothing of ours — harvest and chain only |
-| `CHA_CHING_COOLDOWN` | `3` | seconds between rings; spend in between accrues into the next one |
-| `CHA_CHING_FADE` | `4` | seconds for the floating number to fade out |
-| `CHA_CHING_MIN` | `0.005` | spend below this is not worth a sound |
-| `CHA_CHING_BANDS` | `10` | announce context every N percent |
-| `CHA_CHING_ESTIMATE` | `1` | `0` hides the `[~$0.18]` submit-cost figure |
-| `CHA_CHING_SAMPLES` | `6` | completed turns kept to calibrate it |
-| `CHA_CHING_SOUND` | bundled | path to your own wav |
-| `CHA_CHING_MUTE` | `0` | `1` keeps the number, drops the sound |
+| `RTC_CHAIN` | — | your statusline command; gets the same payload, output appended |
+| `RTC_SEGMENT` | `1` | `0` renders nothing of ours — harvest and chain only |
+| `RTC_COOLDOWN` | `3` | seconds between rings; spend in between accrues into the next one |
+| `RTC_FADE` | `4` | seconds for the floating number to fade out |
+| `RTC_MIN` | `0.005` | spend below this is not worth a sound |
+| `RTC_BANDS` | `10` | announce context every N percent |
+| `RTC_ESTIMATE` | `1` | `0` hides the `[~$0.18]` submit-cost figure |
+| `RTC_SAMPLES` | `6` | completed turns kept to calibrate it |
+| `RTC_SOUND` | bundled | path to your own wav |
+| `RTC_MUTE` | `0` | `1` keeps the number, drops the sound |
 
 Cost updates once per API response, so a tool-heavy turn would ring a dozen times. The cooldown
 rate-limits the *ring*, not the accounting — spend during the quiet window accrues and lands as one
@@ -126,12 +128,12 @@ approximates a bare submit — one API call, a submit plus a few tokens of reply
 work are strictly dearer and cannot drag it down.
 
 Checked against first principles on a live session: the learned figure said `$0.18` where
-`332,258 tokens × $0.50/M` gives `$0.17`, with no price table anywhere in the plugin. That is the
+`332,258 tokens × $0.50/M` gives `$0.17`, with no price table anywhere in RTC. That is the
 point — it stays correct across models, plans and rate changes because it measures instead of
 asserting.
 
 It appears after your first completed turn, dimmed, and reaches full colour at three.
-`cha-ching doctor` reports calibration per session, never totalled across them.
+`rtc doctor` reports calibration per session, never totalled across them.
 
 **It cannot account for what you are typing.** The payload carries `prompt_id` but never the draft
 text. For the same reason the figure cannot appear only while you type: measured over a 68-second
@@ -142,7 +144,7 @@ keystrokes produced none at all. There is no typing signal to key off.
 
 A cache read is `$0.50` per million tokens. A cache *write* on the 1-hour TTL is `$10` — twenty times
 dearer. So submitting the same window costs one of two very different amounts depending on whether
-the cache is still alive, and cha-ching tracks which:
+the cache is still alive, and realtokencost tracks which:
 
 ```
 [~$0.19]         blue    cached. re-read at read rate.
@@ -185,7 +187,7 @@ render to 10ms and about 25%. The remainder is process startup — `bash` and `j
 so there is no clever way to shave it further from inside the script.
 
 If you keep many sessions open, raise `refreshInterval` to 2 or 3. The only thing you lose is
-smoothness in the fade. `cha-ching doctor` shows the arithmetic for your machine.
+smoothness in the fade. `rtc doctor` shows the arithmetic for your machine.
 
 ## How it works, and why it has to
 
@@ -193,12 +195,12 @@ Claude Code hands `cost` and `context_window` to the statusline and to nothing e
 carry neither. The request to expose context usage to hooks
 ([#27969](https://github.com/anthropics/claude-code/issues/27969)) was closed as a duplicate.
 
-So the statusline is the only place the data exists, and it is where cha-ching sits. It parks what it
+So the statusline is the only place the data exists, and it is where RTC sits. It parks what it
 harvests in `$XDG_RUNTIME_DIR`, and the hook reads it from there. No transcript parsing, no token
 counting, no price table that goes stale — the figures are the CLI's own.
 
 That is also why the statusline step is not optional. Skip it and the plugin has no data and stays
-quiet. `cha-ching doctor` will say so.
+quiet. `rtc doctor` will say so.
 
 The percentage is recomputed from raw token counts rather than taken from `used_percentage`, which is
 rounded to a whole number — one point is 10k tokens on a 1M window. It truncates rather than rounds,
