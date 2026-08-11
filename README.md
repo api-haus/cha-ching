@@ -223,6 +223,12 @@ so the figure never overstates and always agrees with the bar beside it.
 
 Developed and tested on Linux. The macOS paths are written but untested — reports welcome.
 
+## Contributing
+
+[AGENTS.md](AGENTS.md) is the starting point — the constraints that shape the design, what the runtime
+state looks like, how to drive the script without a live session, and a list of things deliberately
+not done so they do not get helpfully re-added.
+
 ## Credits
 
 The cash register is [Sound Effects Library](https://www.free-stock-music.com/sound-effects-library-cash-register-sound.html)

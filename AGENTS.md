@@ -1,0 +1,197 @@
+# AGENTS.md
+
+realtokencost (`rtc`) is a Claude Code plugin: a statusline segment plus a hook. It shows what
+submitting the current context costs *before* you press enter, whether the prompt cache is still
+alive to make that the cheap number, rings a cash register when money moves, and warns as the window
+fills. `README.md` is written for users; this file is what you need to change the thing.
+
+Everything below was verified against Claude Code 2.1.227 by reading the binary and live payloads.
+Where a claim is checkable, the check is named. Re-verify rather than trust if a claim starts costing
+you time — the CLI moves.
+
+## The constraints that shape the design
+
+Read these before proposing an architecture change. Each one has already been paid for.
+
+**A plugin cannot register a statusline.** `statusLine` is a settings key with no plugin path — there
+is no `pluginStatusLine` identifier in the binary. Hooks install themselves via `hooks/hooks.json`;
+the statusline needs `rtc setup` to write `settings.json`. This asymmetry is why setup exists at all.
+
+**Hook payloads carry neither cost nor context.** `cost.total_cost_usd` and `context_window` are
+handed to the statusline and to nothing else. The request to expose context usage to hooks
+([anthropics/claude-code#27969](https://github.com/anthropics/claude-code/issues/27969)) was closed as
+a duplicate. So the statusline harvests to files under `$XDG_RUNTIME_DIR` and the hook reads them
+there. That bridge is not a workaround to be cleaned up; it is the only path.
+
+**Never ship a price table.** The CLI has one compiled in (`inputTokens:5, outputTokens:25,
+promptCacheWriteTokens:6.25, promptCacheWrite1hTokens:10, promptCacheReadTokens:0.5` per million) and
+it is exactly what goes stale. `rtc` measures instead: each request bump says this much money bought a
+re-read of this much context. Validated against first principles on a live session — learned `$0.18`
+where `332,258 × $0.50/M` gives `$0.17`. Keep it that way.
+
+**`LC_ALL=C` at the top of the script is load-bearing.** Money and percentages are text all the way
+through. Under a comma-decimal locale `awk` and `printf` disagree about what `9.76` means and the
+arithmetic silently stops working. Found on a Ukrainian-locale shell.
+
+**One API response writes several transcript records.** Text, thinking and each `tool_use` block get
+their own record, and every one carries the same `usage` object. Any transcript analysis must
+`group_by(.message.id)` first. Summing records inflated a measurement by roughly half before this was
+caught.
+
+**The version must bump for an update to reach an install.** Refreshing a marketplace does not
+re-fetch a plugin whose version has not moved. A fix left at the same version sits unreachable; this
+has already happened once.
+
+## Layout
+
+```
+bin/rtc                      everything — one bash script, five subcommands
+hooks/hooks.json             UserPromptSubmit -> ${CLAUDE_PLUGIN_ROOT}/bin/rtc hook
+commands/setup.md            /realtokencost:setup
+share/cash-register.wav      CC0, see share/ATTRIBUTION.md
+.claude-plugin/plugin.json   plugin manifest
+.claude-plugin/marketplace.json   single-plugin marketplace, source "./"
+```
+
+`rtc statusline` is what `statusLine.command` runs. `rtc hook`, `setup`, `uninstall`, `doctor` are
+the rest. `doctor` exists to answer "why is it quiet" without a debugging session — extend it when you
+add a way for things to be quiet.
+
+## Runtime state
+
+Per session under `$XDG_RUNTIME_DIR` (falling back to `TMPDIR`), keyed by `session_id`:
+
+| file | holds |
+|---|---|
+| `rtc-<id>.state` | ten space-separated fields, order below |
+| `rtc-<id>.turns` | recent ordinary request ratios, `$` per million tokens of context |
+| `rtc-<id>.rebuilds` | ratios from requests that rebuilt the cache — a different thing entirely |
+| `rtc-<id>.ctx` | `used size`, the bridge the hook reads |
+| `rtc-<id>.line` | cache key on line 1, rendered segment on line 2 |
+| `rtc-<id>.band` | highest context band already announced |
+| `rtc-<id>.nudged` | set once when told to run setup |
+
+State field order, positional, read with one `read`:
+
+```
+cost pending ring_ts shown shown_ts prev_prompt turn_cost turn_ctx last_call ttl
+```
+
+Adding a field means appending and widening the `read` — never reordering. Old state files are read
+by new binaries in the wild.
+
+Across sessions, `$XDG_CACHE_HOME/realtokencost/rate-<model_id>` holds what a bare submit costs for
+that model. It is a property of the model, not the session, so a new session inherits it and shows a
+figure immediately instead of relearning a constant. Only ordinary requests teach it.
+
+## Things deliberately not done
+
+Do not "fix" these. Each was tried or considered and rejected for a reason.
+
+**Predicting what the turn will do.** An earlier version showed a range whose upper bound guessed how
+many tool calls Claude would make. That is a property of the work, not of the context, and no history
+predicts it — measured spread was 7.8× between a bare reply and a tool-heavy turn. Only the submit
+cost is knowable before the request is sent, and only that is shown.
+
+**Cost per keystroke.** The payload carries `prompt_id` but never the draft text. There is nothing to
+estimate from.
+
+**Showing the figure only while typing.** Needs a typing signal. Measured over 68 seconds across two
+dozen live sessions, every render arrived on the `refreshInterval` timer; keystrokes produced none.
+The busiest session showed 7 sub-second gaps in 112, all tool activity.
+
+**Averaging the estimate.** It takes the cheapest observed ratio, not a mean or median. A minimum
+cannot be dragged up by a tool-heavy turn or by a $3 cache rebuild, which is the whole point.
+
+## Cache state
+
+A cache read is `$0.50` per million; a 1-hour cache write is `$10`. A lapsed prefix rewrites the whole
+window — observed at `$3.03` for a one-word reply, seventeen times a normal turn.
+
+The clock starts when a request completes, which is exactly when `cost` bumps, so the statusline
+already knows. The TTL itself comes from the transcript, which breaks `cache_creation` into
+`ephemeral_1h_input_tokens` and `ephemeral_5m_input_tokens`; the statusline payload carries only a
+flat total. That read is the one thing touching disk, paced to once per turn by `prompt_id`.
+
+A request is classed as a rebuild when `cache_creation_input_tokens > cache_read_input_tokens` in
+`current_usage`. A prefix change — an MCP server connecting or disconnecting rewrites the tool list —
+causes one and cannot be predicted. A lapsed TTL causes one and can.
+
+## Performance
+
+`refreshInterval: 1` re-runs the statusline every second **for every open session**. Measured at 13ms
+× 25 sessions ≈ 32% of a core, which is why the rendered line is cached and rebuilt only when its key
+changes (`used|size|cost|prompt|minute`). Steady state is 10ms.
+
+The remainder is `bash` and `jq` starting up, not rendering, so there is no more to shave from inside
+the script. The minute counter in the key exists so a window cannot go cold behind a cached line that
+still claims it is warm.
+
+Anything added to the render path is paid once per second per session. Weigh it accordingly.
+
+## The sound
+
+`share/cash-register.wav` carries **400ms of silence in front**, and that is not padding to be
+trimmed. Audio sinks suspend when idle and waking one swallows the start of a short sample — badly
+over Bluetooth, where resuming the A2DP link costs hundreds of milliseconds. The register's opening
+strike is in the first 50ms, so without the lead-in you hear the tail ring alone: a "ding" where a
+"ka-ching" should be. `share/ATTRIBUTION.md` carries the exact ffmpeg line to regenerate it.
+
+## Testing
+
+There is no test suite. Drive the script with synthetic payloads on stdin — everything it needs is in
+the JSON:
+
+```bash
+printf '{"session_id":"t","model":{"display_name":"Opus 5","id":"claude-opus-5"},"prompt_id":"p1",
+"cost":{"total_cost_usd":10.00},"context_window":{"total_input_tokens":300000,
+"context_window_size":1000000,"current_usage":{"cache_creation_input_tokens":900,
+"cache_read_input_tokens":300000}}}' | RTC_MUTE=1 bin/rtc
+```
+
+Feed successive renders with rising `cost` to exercise the ring, the fade and sampling. Use a scratch
+`session_id` and delete `$XDG_RUNTIME_DIR/rtc-<id>.*` between runs, or you will debug yesterday's
+state. `XDG_CACHE_HOME` to a temp dir keeps a test from teaching the real model rate.
+
+Time-dependent behaviour — fade, cooldown, cache expiry — is tested by rewriting the timestamp in the
+state file rather than sleeping. Rewrite it with `printf "%.6f"`; `awk`'s default output format turns
+an epoch into `1.78648e+09` and the test silently stops meaning anything.
+
+## Releasing
+
+```bash
+# bump BOTH manifests — they are checked independently
+sed -i 's/"version": "X"/"version": "Y"/' .claude-plugin/plugin.json .claude-plugin/marketplace.json
+git commit && git push
+claude plugin marketplace update realtokencost
+claude plugin uninstall realtokencost@realtokencost
+claude plugin install realtokencost@realtokencost
+"$(ls -d ~/.claude/plugins/cache/realtokencost/realtokencost/*/ | sort -V | tail -1)bin/rtc" setup
+```
+
+`setup` must be re-run after every install: it writes an absolute versioned path into `statusLine`,
+and the old one stops existing. Restart Claude Code afterwards — `statusLine` is read at startup, so a
+running session keeps the path it started with.
+
+Old versions stay on disk under `.../realtokencost/realtokencost/<version>/`. Always pick the highest
+with `sort -V | tail -1`; `find … | head -1` returns the stale one.
+
+**The self-chain guard must know every name this has ever had.** `setup` records the existing
+statusline as a chain target, and must refuse when that target is us under an old name. The rename
+from `cha-ching` walked straight into this: the guard knew only the current name, saw the abandoned
+`cha-ching` binary still in the plugin cache, and chained it. Two copies rendering, both writing one
+state file. If the project is ever renamed again, add the old name to that pattern.
+
+## Prior art
+
+The statusline space is crowded — [ccstatusline](https://github.com/sirmalloc/ccstatusline),
+[TheoBrigitte](https://github.com/TheoBrigitte/claude-statusline),
+[ClaudeCodeStatusLine](https://github.com/daniel3303/ClaudeCodeStatusLine) and others. All of them
+show what you have already spent, and all of them take the single `statusLine` slot outright.
+Prompt-cache timers exist too: a [gist by jesserobbins](https://gist.github.com/jesserobbins/ff344a13f3b90cddb8e6b1e19e7e604e)
+and [claude-code-usage-bar](https://github.com/leeguooooo/claude-code-usage-bar). Both assume a
+5-minute TTL — the gist says so outright, "we can't query it directly" — and neither attaches money.
+
+What is ours: a forward-looking figure, a read TTL rather than an assumed one, a dollar cost for the
+cold state, and chaining instead of replacing. Keep those distinct when changing anything; they are
+the reason for the project.
