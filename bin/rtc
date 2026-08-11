@@ -379,10 +379,14 @@ cmd_setup() {
   local current backup tmp
   current=$(jq -r '.statusLine.command // empty' "$SETTINGS")
 
-  # Never chain to ourselves. Re-running setup, or moving from a checkout to an
-  # installed copy, would otherwise wire realtokencost into its own chain and render
-  # the gauge twice — with the second copy fighting the first over the state file.
-  if [ -n "$current" ] && [ "$current" != "$SELF" ] && ! printf '%s' "$current" | grep -q 'realtokencost'; then
+  # Never chain to ourselves, under any name we have ever had. Re-running setup,
+  # moving from a checkout to an installed copy, or renaming the project would
+  # otherwise wire this into its own chain and render the gauge twice, with the
+  # two copies fighting over one state file. The rename to realtokencost proved
+  # the point: a guard that knew only the current name promptly chained the
+  # abandoned cha-ching binary, which was still sitting in the plugin cache.
+  if [ -n "$current" ] && [ "$current" != "$SELF" ] &&
+     ! printf '%s' "$current" | grep -qE 'realtokencost|cha-ching|/rtc([[:space:]]|$)'; then
     mkdir -p "$CONFIG_DIR"
     if grep -q '^RTC_CHAIN=' "$CONFIG" 2>/dev/null; then
       printf 'keeping the chain already in %s\n' "$CONFIG"
