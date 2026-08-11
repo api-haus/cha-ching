@@ -2,7 +2,7 @@
   "name": "cha-ching",
   "displayName": "cha-ching — hear what Claude Code costs you",
   "description": "A spend ticker and context gauge that rides alongside whatever statusline you already run. Rings a cash register when money moves, floats a fading +$0.42 where you can see it, and warns as the context window fills. Chains to ccstatusline or any other statusline instead of replacing it.",
-  "version": "1.0.1",
+  "version": "1.1.0",
   "author": {
     "name": "Kassinity"
   },

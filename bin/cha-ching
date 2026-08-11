@@ -45,6 +45,8 @@ FADE=${CHA_CHING_FADE:-4}          # seconds for the floating number to die
 COOLDOWN=${CHA_CHING_COOLDOWN:-3}  # seconds between rings; spend in between accrues
 MIN=${CHA_CHING_MIN:-0.005}        # spend below this is not worth a sound
 BANDS=${CHA_CHING_BANDS:-10}       # announce context every N percent
+ESTIMATE=${CHA_CHING_ESTIMATE:-1}  # 0 hides the [~$0.42] next-message estimate
+SAMPLES=${CHA_CHING_SAMPLES:-6}    # completed turns kept to calibrate the estimate
 
 die() { printf '%s\n' "$*" >&2; exit 1; }
 now_s() { date +%s.%N 2>/dev/null || date +%s; }
@@ -54,24 +56,25 @@ cmd_statusline() {
   local payload model effort used size cost session
   payload=$(cat)
 
-  IFS=$'\t' read -r model effort used size cost session < <(
+  IFS=$'\t' read -r model effort used size cost session prompt < <(
     printf '%s' "$payload" | jq -r '
       [ (.model.display_name // "?"),
         (.effort.level // "-"),
         (.context_window.total_input_tokens // 0),
         (.context_window.context_window_size // 0),
         (.cost.total_cost_usd // 0),
-        (.session_id // "")
+        (.session_id // ""),
+        (.prompt_id // "-")
       ] | @tsv' 2>/dev/null
   )
   [ -n "${model:-}" ] || exit 0
 
-  local now state last pending ring_ts shown shown_ts ring=0
+  local now state last pending ring_ts shown shown_ts prev_prompt turn_cost turn_ctx ring=0
   now=$(now_s)
   state="$RUN/cha-ching-${session:-nosession}.state"
 
-  last=""; pending=0; ring_ts=0; shown=0; shown_ts=0
-  [ -r "$state" ] && IFS=' ' read -r last pending ring_ts shown shown_ts < "$state" 2>/dev/null
+  last=""; pending=0; ring_ts=0; shown=0; shown_ts=0; prev_prompt="-"; turn_cost=""; turn_ctx=0
+  [ -r "$state" ] && IFS=' ' read -r last pending ring_ts shown shown_ts prev_prompt turn_cost turn_ctx < "$state" 2>/dev/null
 
   if [ -z "${last:-}" ]; then
     # First sight. Adopt the total silently — announcing a session's whole
@@ -94,7 +97,28 @@ cmd_statusline() {
     fi
   fi
 
-  printf '%s %s %s %s %s\n' "$cost" "$pending" "$ring_ts" "$shown" "$shown_ts" > "$state.tmp" 2>/dev/null &&
+  # A completed turn is the only honest unit to predict from. prompt_id changes
+  # when a new prompt starts, so its previous value bounds the turn that just
+  # ended: what it cost, and how much context it was re-reading while it ran.
+  # Store the ratio, not the cost — that is what carries to a bigger window.
+  if [ "$prompt" != "$prev_prompt" ]; then
+    if [ -n "${turn_cost:-}" ] && [ "${turn_ctx:-0}" -gt 1000 ]; then
+      awk -v c0="$turn_cost" -v c1="$cost" -v ctx="$turn_ctx" \
+        'BEGIN { d = c1 - c0; if (d > 0) printf "%.6f\n", d / (ctx / 1000000) }' \
+        >> "$RUN/cha-ching-${session:-nosession}.turns" 2>/dev/null || true
+      # Keep only recent turns: a session's shape changes as the work changes.
+      tail -n "$SAMPLES" "$RUN/cha-ching-${session:-nosession}.turns" \
+        > "$RUN/cha-ching-${session:-nosession}.turns.tmp" 2>/dev/null &&
+        mv -f "$RUN/cha-ching-${session:-nosession}.turns.tmp" \
+              "$RUN/cha-ching-${session:-nosession}.turns" 2>/dev/null || true
+    fi
+    prev_prompt=$prompt
+    turn_cost=$cost
+    turn_ctx=$used
+  fi
+
+  printf '%s %s %s %s %s %s %s %s\n' "$cost" "$pending" "$ring_ts" "$shown" "$shown_ts" \
+    "$prev_prompt" "${turn_cost:-$cost}" "${turn_ctx:-$used}" > "$state.tmp" 2>/dev/null &&
     mv -f "$state.tmp" "$state" 2>/dev/null || true
 
   # Context, parked where the band hook can read it.
@@ -103,7 +127,37 @@ cmd_statusline() {
   [ "$ring" = 1 ] && play_sound
 
   local segment="" chain=""
-  [ "${CHA_CHING_SEGMENT:-1}" != "0" ] && segment=$(render "$model" "$effort" "$used" "$size" "$cost" "$shown" "$shown_ts" "$now")
+  if [ "${CHA_CHING_SEGMENT:-1}" != "0" ]; then
+    # A render is three processes and the statusline re-runs every second for
+    # every open session — measured at 38% of a core across two dozen of them.
+    # Most of those renders have nothing new to say, so the line is cached and
+    # only rebuilt when something it depends on moves. A fade in progress
+    # changes the line every frame and is never cached.
+    local cache key fading=0 age fade_int=${FADE%.*}
+    cache="$RUN/cha-ching-${session:-nosession}.line"
+    key="$used|$size|$cost|$prompt"
+
+    if [ "${shown_ts%.*}" != "0" ]; then
+      age=$(( ${now%.*} - ${shown_ts%.*} ))
+      [ "$age" -le "$((fade_int + 1))" ] && fading=1
+    fi
+
+    if [ "$fading" = 0 ] && [ -r "$cache" ]; then
+      local cached_key cached_line
+      { read -r cached_key; read -r cached_line; } < "$cache" 2>/dev/null
+      [ "${cached_key:-}" = "$key" ] && segment=$cached_line
+    fi
+
+    if [ -z "$segment" ]; then
+      local est=""
+      [ "$ESTIMATE" != "0" ] && est=$(estimate "$RUN/cha-ching-${session:-nosession}.turns" "$used" 2>/dev/null)
+      segment=$(render "$model" "$effort" "$used" "$size" "$cost" "$shown" "$shown_ts" "$now" "${est:-}")
+      [ "$fading" = 0 ] && {
+        printf '%s\n%s\n' "$key" "$segment" > "$cache.tmp" 2>/dev/null &&
+          mv -f "$cache.tmp" "$cache" 2>/dev/null || true
+      }
+    fi
+  fi
 
   if [ -n "${CHA_CHING_CHAIN:-}" ]; then
     chain=$(printf '%s' "$payload" | eval "${CHA_CHING_CHAIN}" 2>/dev/null)
@@ -116,9 +170,34 @@ cmd_statusline() {
   fi
 }
 
+# What the next message will cost, learned from this session rather than from a
+# price table that would go stale the day rates move.
+#
+# The dominant term is re-reading the context you already have, which scales with
+# window size — so what carries between turns is the ratio, dollars per million
+# tokens of context, not the dollar figure itself. Median rather than mean: one
+# turn that read forty files should not set the expectation for the next.
+estimate() {
+  local turns="$1" ctx="$2"
+  [ -r "$turns" ] || return 1
+  [ "${ctx:-0}" -gt 0 ] || return 1
+  awk -v ctx="$ctx" '
+    { r[n++] = $1 + 0 }
+    END {
+      if (n < 3) exit 1                       # too few turns to be worth a number
+      for (i = 0; i < n; i++)
+        for (j = i + 1; j < n; j++)
+          if (r[j] < r[i]) { t = r[i]; r[i] = r[j]; r[j] = t }
+      m = (n % 2) ? r[int(n/2)] : (r[n/2 - 1] + r[n/2]) / 2
+      e = m * (ctx / 1000000)
+      if (e <= 0) exit 1
+      printf "%.2f", e
+    }' "$turns"
+}
+
 render() {
   awk -v model="$1" -v effort="$2" -v used="$3" -v size="$4" -v cost="$5" \
-      -v delta="$6" -v dts="$7" -v now="$8" -v fade="$FADE" '
+      -v delta="$6" -v dts="$7" -v now="$8" -v est="$9" -v fade="$FADE" '
   function scale(n) { return n >= 1000000 ? sprintf("%.2fM", n/1000000) : sprintf("%.0fk", n/1000) }
   function rgb(r, g, b) { return sprintf("\033[38;2;%d;%d;%dm", r, g, b) }
   BEGIN {
@@ -140,6 +219,9 @@ render() {
       out = out " " DIM scale(used) " / " scale(size) RESET
     }
     out = out sprintf(" %s$%.2f%s", DIM, cost, RESET)
+
+    # What the next message is likely to cost, before it is sent.
+    if (est != "") out = out sprintf(" %s[~$%s]%s", rgb(96,165,250), est, RESET)
 
     # The floating number. Age drives it, so a render landing at any moment gets
     # the right colour rather than a fixed frame.
@@ -285,6 +367,26 @@ cmd_doctor() {
 
   ok=$(ls "$RUN"/cha-ching-*.state 2>/dev/null | wc -l)
   printf '  live data   %s session(s) reporting\n' "$ok"
+
+  # refreshInterval 1 re-runs this for every open session, every second. That is
+  # cheap once and not cheap two dozen times, so show the arithmetic.
+  if [ "$ok" -gt 0 ]; then
+    printf '  render cost ~%dms each; %s session(s) at refreshInterval %s ≈ %s%% of a core\n' \
+      10 "$ok" "$(jq -r '.statusLine.refreshInterval // 1' "$SETTINGS" 2>/dev/null)" \
+      "$(awk -v n="$ok" -v r="$(jq -r '.statusLine.refreshInterval // 1' "$SETTINGS" 2>/dev/null)" \
+         'BEGIN { printf "%.0f", 10 * n / (r > 0 ? r : 1) / 10 }')"
+    [ "$ok" -gt 8 ] && printf '              many sessions — raising refreshInterval to 2 or 3 halves that\n'
+  fi
+
+  local turns
+  turns=$(cat "$RUN"/cha-ching-*.turns 2>/dev/null | wc -l)
+  if [ "$ESTIMATE" = "0" ]; then
+    printf '  estimate    off\n'
+  elif [ "$turns" -lt 3 ]; then
+    printf '  estimate    calibrating (%s of 3 turns needed before it shows a number)\n' "$turns"
+  else
+    printf '  estimate    calibrated on %s recent turn(s)\n' "$turns"
+  fi
 }
 
 case "${1:-statusline}" in

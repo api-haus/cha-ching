@@ -3,8 +3,9 @@
 Hear what Claude Code costs you, and watch the context fill.
 
 ```
-Opus 5  xhigh  █░░░░░░░░░ 18%  182k / 1.00M  $9.76  +$0.03
-                                                     ╰─ rings, then fades over 4s
+Opus 5  xhigh  █░░░░░░░░░ 18%  182k / 1.00M  $9.76  [~$0.42]  +$0.03
+                                                       │        ╰─ rings, then fades over 4s
+                                                       ╰─ what the next message will cost
 ```
 
 It does not replace your statusline. It rides alongside the one you already run.
@@ -99,12 +100,57 @@ shell.
 | `CHA_CHING_FADE` | `4` | seconds for the floating number to fade out |
 | `CHA_CHING_MIN` | `0.005` | spend below this is not worth a sound |
 | `CHA_CHING_BANDS` | `10` | announce context every N percent |
+| `CHA_CHING_ESTIMATE` | `1` | `0` hides the `[~$0.42]` next-message estimate |
+| `CHA_CHING_SAMPLES` | `6` | completed turns kept to calibrate that estimate |
 | `CHA_CHING_SOUND` | bundled | path to your own wav |
 | `CHA_CHING_MUTE` | `0` | `1` keeps the number, drops the sound |
 
 Cost updates once per API response, so a tool-heavy turn would ring a dozen times. The cooldown
 rate-limits the *ring*, not the accounting — spend during the quiet window accrues and lands as one
 weightier number. Nothing is dropped.
+
+## What the next message will cost
+
+The dominant cost of your next message is re-reading the context you already have. At 800k that is
+most of the bill before Claude writes a word, which is exactly the number no interface shows you
+until the money is gone.
+
+`[~$0.42]` is that figure, in blue, before you press enter. It is learned from your own session
+rather than from a price table:
+
+```
+estimate = median(turn_cost ÷ turn_context) × current_context
+```
+
+`prompt_id` changes when a new prompt starts, so each completed turn yields one sample of dollars per
+million tokens of context. The *ratio* is what carries to a larger window, not the dollar figure.
+Median rather than mean, because one turn that read forty files should not set the expectation for
+the next.
+
+That makes it model-agnostic, plan-agnostic, and immune to rate changes — it measures what your work
+actually costs instead of asserting what it should. It stays blank until three turns have completed
+rather than showing a number it has not earned.
+
+**It cannot account for what you are typing.** The statusline payload carries `prompt_id` but never
+the draft text, so per-keystroke estimation is impossible — not awkward, absent. For the same reason
+the estimate cannot appear only while you type: measured over a 68-second window across two dozen
+live sessions, every render arrived on the `refreshInterval` timer and keystrokes produced no render
+at all. There is no typing signal to key off.
+
+## Cost of running it
+
+`refreshInterval: 1` re-runs the statusline every second **for every open session**. Measured here:
+
+```
+13ms per render × 25 live sessions × 1/s ≈ 32% of one core
+```
+
+So the line is cached and rebuilt only when something it depends on moves, which takes a steady-state
+render to 10ms and about 25%. The remainder is process startup — `bash` and `jq` — not the rendering,
+so there is no clever way to shave it further from inside the script.
+
+If you keep many sessions open, raise `refreshInterval` to 2 or 3. The only thing you lose is
+smoothness in the fade. `cha-ching doctor` shows the arithmetic for your machine.
 
 ## How it works, and why it has to
 
