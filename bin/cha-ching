@@ -1,0 +1,296 @@
+#!/usr/bin/env bash
+# cha-ching — hear what Claude Code costs you, and watch the context fill.
+#
+# Claude Code hands cost and context-window figures to the statusline and to
+# nothing else. Hook payloads carry neither, and the request to expose context
+# to hooks was closed as a duplicate. So this sits in the statusLine slot,
+# harvests both, and hands the payload straight on to whatever statusline you
+# already run.
+#
+#   cha-ching statusline   harvest, render, chain   (what statusLine.command runs)
+#   cha-ching hook         context band warnings    (wired by the plugin)
+#   cha-ching setup        claim the statusLine slot, keeping what was there
+#   cha-ching uninstall    give it back
+#   cha-ching doctor       explain why it is quiet
+set -u
+
+# Money and percentages are text all the way through here. Under a comma-decimal
+# locale awk and printf disagree about what "9.76" means and the arithmetic
+# silently stops working.
+export LC_ALL=C
+
+SELF=$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")
+HERE=$(dirname "$SELF")
+ROOT=$(dirname "$HERE")
+RUN=${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/cha-ching"
+CONFIG="$CONFIG_DIR/config"
+SETTINGS="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json"
+
+# Config is a file rather than shell exports because hooks and the statusline are
+# launched by Claude Code, which need not have inherited your shell's env. A real
+# environment variable still wins.
+if [ -r "$CONFIG" ]; then
+  while IFS='=' read -r key value; do
+    case "$key" in
+      CHA_CHING_*)
+        value=${value%\"}; value=${value#\"}
+        [ -z "${!key:-}" ] && export "$key=$value"
+        ;;
+    esac
+  done < "$CONFIG"
+fi
+
+FADE=${CHA_CHING_FADE:-4}          # seconds for the floating number to die
+COOLDOWN=${CHA_CHING_COOLDOWN:-3}  # seconds between rings; spend in between accrues
+MIN=${CHA_CHING_MIN:-0.005}        # spend below this is not worth a sound
+BANDS=${CHA_CHING_BANDS:-10}       # announce context every N percent
+
+die() { printf '%s\n' "$*" >&2; exit 1; }
+now_s() { date +%s.%N 2>/dev/null || date +%s; }
+
+# ── statusline ────────────────────────────────────────────────────────────────
+cmd_statusline() {
+  local payload model effort used size cost session
+  payload=$(cat)
+
+  IFS=$'\t' read -r model effort used size cost session < <(
+    printf '%s' "$payload" | jq -r '
+      [ (.model.display_name // "?"),
+        (.effort.level // "-"),
+        (.context_window.total_input_tokens // 0),
+        (.context_window.context_window_size // 0),
+        (.cost.total_cost_usd // 0),
+        (.session_id // "")
+      ] | @tsv' 2>/dev/null
+  )
+  [ -n "${model:-}" ] || exit 0
+
+  local now state last pending ring_ts shown shown_ts ring=0
+  now=$(now_s)
+  state="$RUN/cha-ching-${session:-nosession}.state"
+
+  last=""; pending=0; ring_ts=0; shown=0; shown_ts=0
+  [ -r "$state" ] && IFS=' ' read -r last pending ring_ts shown shown_ts < "$state" 2>/dev/null
+
+  if [ -z "${last:-}" ]; then
+    # First sight. Adopt the total silently — announcing a session's whole
+    # accumulated spend as a single hit would be a lie.
+    :
+  else
+    # Every bump accrues. The ring is rate-limited, not the accounting, so a
+    # tool-heavy turn lands as a few weighty numbers instead of a stream of
+    # small ones, and nothing is ever dropped.
+    pending=$(awk -v p="${pending:-0}" -v c="$cost" -v l="$last" \
+      'BEGIN { d = c - l; printf "%.6f", p + (d > 0 ? d : 0) }')
+
+    if awk -v p="$pending" -v m="$MIN" -v n="$now" -v r="${ring_ts:-0}" -v cd="$COOLDOWN" \
+        'BEGIN { exit !(p >= m && n - r >= cd) }'; then
+      ring=1
+      shown=$pending
+      shown_ts=$now
+      ring_ts=$now
+      pending=0
+    fi
+  fi
+
+  printf '%s %s %s %s %s\n' "$cost" "$pending" "$ring_ts" "$shown" "$shown_ts" > "$state.tmp" 2>/dev/null &&
+    mv -f "$state.tmp" "$state" 2>/dev/null || true
+
+  # Context, parked where the band hook can read it.
+  printf '%s %s\n' "$used" "$size" > "$RUN/cha-ching-${session:-nosession}.ctx" 2>/dev/null || true
+
+  [ "$ring" = 1 ] && play_sound
+
+  local segment="" chain=""
+  [ "${CHA_CHING_SEGMENT:-1}" != "0" ] && segment=$(render "$model" "$effort" "$used" "$size" "$cost" "$shown" "$shown_ts" "$now")
+
+  if [ -n "${CHA_CHING_CHAIN:-}" ]; then
+    chain=$(printf '%s' "$payload" | eval "${CHA_CHING_CHAIN}" 2>/dev/null)
+  fi
+
+  if [ -n "$segment" ] && [ -n "$chain" ]; then
+    printf '%s  %s' "$segment" "$chain"
+  else
+    printf '%s%s' "$segment" "$chain"
+  fi
+}
+
+render() {
+  awk -v model="$1" -v effort="$2" -v used="$3" -v size="$4" -v cost="$5" \
+      -v delta="$6" -v dts="$7" -v now="$8" -v fade="$FADE" '
+  function scale(n) { return n >= 1000000 ? sprintf("%.2fM", n/1000000) : sprintf("%.0fk", n/1000) }
+  function rgb(r, g, b) { return sprintf("\033[38;2;%d;%d;%dm", r, g, b) }
+  BEGIN {
+    RESET = "\033[0m"; DIM = "\033[2m"
+    out = DIM model RESET
+    if (effort != "-" && effort != "null" && effort != "") out = out " " DIM effort RESET
+
+    if (size > 0) {
+      pct = used / size * 100
+      filled = int(pct / 10); if (filled > 10) filled = 10
+      bar = ""
+      for (i = 0; i < 10; i++) bar = bar (i < filled ? "█" : "░")
+
+      # Truncate, never round. The figure must not overstate, and must agree
+      # with the bar sitting next to it.
+      shown = pct < 10 ? sprintf("%.1f", int(pct*10)/10) : sprintf("%d", int(pct))
+      colour = pct >= 80 ? rgb(248,113,113) : (pct >= 50 ? rgb(251,191,36) : rgb(74,222,128))
+      out = out " " colour bar " " shown "%" RESET
+      out = out " " DIM scale(used) " / " scale(size) RESET
+    }
+    out = out sprintf(" %s$%.2f%s", DIM, cost, RESET)
+
+    # The floating number. Age drives it, so a render landing at any moment gets
+    # the right colour rather than a fixed frame.
+    age = now - dts
+    if (dts > 0 && delta > 0 && age < fade) {
+      t = age / fade
+      k = t < 0.15 ? 0 : (t - 0.15) / 0.85     # holds bright for a beat, then falls
+      bold = t < 0.15 ? "\033[1m" : ""
+      out = out sprintf("  %s%s+$%.2f%s", bold, rgb(134 + (26-134)*k, 239 + (48-239)*k, 172 + (36-172)*k), delta, RESET)
+    }
+    printf "%s", out
+  }'
+}
+
+play_sound() {
+  [ "${CHA_CHING_MUTE:-0}" = "1" ] && return 0
+  local wav p
+  wav=${CHA_CHING_SOUND:-$ROOT/share/ca-ching.wav}
+  [ -s "$wav" ] || return 0
+  for p in pw-play paplay aplay afplay; do
+    if command -v "$p" >/dev/null 2>&1; then
+      # Detached, so a wedged audio server never stalls a render.
+      (setsid "$p" "$wav" >/dev/null 2>&1 &) 2>/dev/null
+      return 0
+    fi
+  done
+}
+
+# ── context band hook ─────────────────────────────────────────────────────────
+cmd_hook() {
+  local payload session ctx used size band last state
+  payload=$(cat)
+  session=$(printf '%s' "$payload" | jq -r '.session_id // empty' 2>/dev/null)
+  [ -n "$session" ] || exit 0
+
+  ctx="$RUN/cha-ching-${session}.ctx"
+  if [ ! -r "$ctx" ]; then
+    # Installed but never set up. The hooks wire themselves and the statusline
+    # cannot, so this is the one failure mode a new user will actually hit —
+    # say it once rather than sitting there silently doing nothing.
+    local nudge="$RUN/cha-ching-${session}.nudged"
+    if [ ! -e "$nudge" ] && ! jq -e '.statusLine.command // "" | test("cha-ching")' "$SETTINGS" >/dev/null 2>&1; then
+      : > "$nudge" 2>/dev/null || true
+      jq -n '{systemMessage: "cha-ching is installed but not wired to the statusline, which is the only place Claude Code exposes cost and context. Run /cha-ching:setup"}'
+    fi
+    exit 0
+  fi
+  IFS=' ' read -r used size < "$ctx" 2>/dev/null
+  case "${used:-}${size:-}" in ''|*[!0-9]*) exit 0 ;; esac
+  [ "${size:-0}" -gt 0 ] || exit 0
+
+  band=$(( used * 100 / size / BANDS ))
+  [ "$band" -ge 1 ] || exit 0
+
+  state="$RUN/cha-ching-${session}.band"
+  last=0
+  [ -r "$state" ] && last=$(cat "$state" 2>/dev/null)
+  case "$last" in ''|*[!0-9]*) last=0 ;; esac
+  [ "$band" -gt "$last" ] || exit 0             # once per band, on the way up
+  printf '%s' "$band" > "$state" 2>/dev/null || true
+
+  jq -n --arg m "context $(( band * BANDS ))% used — $(human "$used") of $(human "$size") tokens" \
+    '{systemMessage: $m}'
+}
+
+human() { awk -v n="$1" 'BEGIN { printf (n >= 1000000 ? "%.2fM" : "%.0fk"), n / (n >= 1000000 ? 1000000 : 1000) }'; }
+
+# ── setup ─────────────────────────────────────────────────────────────────────
+cmd_setup() {
+  command -v jq >/dev/null 2>&1 || die "cha-ching needs jq."
+  [ -f "$SETTINGS" ] || die "no settings.json at $SETTINGS"
+
+  local current backup tmp
+  current=$(jq -r '.statusLine.command // empty' "$SETTINGS")
+
+  if [ -n "$current" ] && [ "$current" != "$SELF" ]; then
+    mkdir -p "$CONFIG_DIR"
+    if grep -q '^CHA_CHING_CHAIN=' "$CONFIG" 2>/dev/null; then
+      printf 'keeping the chain already in %s\n' "$CONFIG"
+    else
+      printf 'CHA_CHING_CHAIN=%s\n' "$current" >> "$CONFIG"
+      printf 'chaining to your existing statusline: %s\n' "$current"
+    fi
+  fi
+
+  backup="$SETTINGS.cha-ching.bak"
+  cp "$SETTINGS" "$backup"
+  tmp=$(mktemp)
+  jq --arg cmd "$SELF" \
+     '.statusLine = {"type":"command","command":$cmd,"refreshInterval":1}' \
+     "$SETTINGS" > "$tmp" && jq empty "$tmp" && mv "$tmp" "$SETTINGS" \
+    || die "failed to write $SETTINGS (backup at $backup)"
+
+  printf 'statusLine claimed. Backup at %s\n' "$backup"
+  printf 'Restart Claude Code.\n'
+}
+
+cmd_uninstall() {
+  local chain tmp
+  chain=$(sed -n 's/^CHA_CHING_CHAIN=//p' "$CONFIG" 2>/dev/null | head -1)
+  tmp=$(mktemp)
+  if [ -n "$chain" ]; then
+    jq --arg cmd "$chain" '.statusLine = {"type":"command","command":$cmd}' "$SETTINGS" > "$tmp"
+    printf 'restored your statusline: %s\n' "$chain"
+  else
+    jq 'del(.statusLine)' "$SETTINGS" > "$tmp"
+    printf 'removed the statusline entry.\n'
+  fi
+  jq empty "$tmp" && mv "$tmp" "$SETTINGS" || die "failed to write $SETTINGS"
+  printf 'Config left at %s — delete it if you are done.\n' "$CONFIG"
+}
+
+# ── doctor ────────────────────────────────────────────────────────────────────
+cmd_doctor() {
+  local ok p found wired
+  printf 'cha-ching doctor\n\n'
+
+  if command -v jq >/dev/null 2>&1; then printf '  jq          %s\n' "$(command -v jq)"
+  else printf '  jq          MISSING — nothing works without it\n'; fi
+
+  found=""
+  for p in pw-play paplay aplay afplay; do
+    command -v "$p" >/dev/null 2>&1 && { found=$p; break; }
+  done
+  if [ -n "$found" ]; then printf '  player      %s\n' "$found"
+  else printf '  player      none of pw-play/paplay/aplay/afplay — it will be silent\n'; fi
+
+  if [ -s "$ROOT/share/ca-ching.wav" ]; then printf '  sound       %s\n' "$ROOT/share/ca-ching.wav"
+  else printf '  sound       MISSING at %s\n' "$ROOT/share/ca-ching.wav"; fi
+
+  wired=$(jq -r '.statusLine.command // "none"' "$SETTINGS" 2>/dev/null)
+  if [ "$wired" = "$SELF" ]; then
+    printf '  statusLine  wired (refreshInterval %s)\n' "$(jq -r '.statusLine.refreshInterval // "unset"' "$SETTINGS")"
+  else
+    printf '  statusLine  NOT wired — currently %s\n' "$wired"
+    printf '              run: cha-ching setup\n'
+  fi
+
+  [ -n "${CHA_CHING_CHAIN:-}" ] && printf '  chain       %s\n' "$CHA_CHING_CHAIN"
+
+  ok=$(ls "$RUN"/cha-ching-*.state 2>/dev/null | wc -l)
+  printf '  live data   %s session(s) reporting\n' "$ok"
+}
+
+case "${1:-statusline}" in
+  statusline) cmd_statusline ;;
+  hook)       cmd_hook ;;
+  setup)      cmd_setup ;;
+  uninstall)  cmd_uninstall ;;
+  doctor)     cmd_doctor ;;
+  -h|--help|help)
+    sed -n '2,16p' "$SELF" | sed 's/^# \{0,1\}//' ;;
+  *) die "unknown command: $1 (try: statusline, hook, setup, uninstall, doctor)" ;;
+esac

@@ -1,0 +1,15 @@
+{
+  "name": "cha-ching",
+  "description": "A spend ticker and context gauge for Claude Code that composes with the statusline you already run.",
+  "version": "1.0.0",
+  "owner": {
+    "name": "api-haus"
+  },
+  "plugins": [
+    {
+      "name": "cha-ching",
+      "source": "./",
+      "description": "Rings a cash register when money moves, floats a fading +$0.42 in the statusline, and warns as the context window fills. Chains to ccstatusline or any other statusline instead of replacing it."
+    }
+  ]
+}
