@@ -181,9 +181,12 @@ estimate() {
   local turns="$1" ctx="$2"
   [ -r "$turns" ] || return 1
   [ "${ctx:-0}" -gt 0 ] || return 1
-  # Emits "<dollars> <samples>". One completed turn is already a better guess
-  # than nothing, so it shows from the first — the caller dims it until enough
-  # turns have landed for the median to mean anything.
+  # Emits "<low> <high> <samples>". A single figure cannot be honest here: turn
+  # cost spans an order of magnitude between "ok" and twenty tool calls, and
+  # nothing can know which one you are about to send. So the floor is the
+  # cheapest turn observed — one API call, driven purely by context size and
+  # therefore genuinely predictable — and the top is the upper quartile, a real
+  # working turn. Heavy turns still exceed it, and that is what a range says.
   awk -v ctx="$ctx" '
     { r[n++] = $1 + 0 }
     END {
@@ -191,10 +194,10 @@ estimate() {
       for (i = 0; i < n; i++)
         for (j = i + 1; j < n; j++)
           if (r[j] < r[i]) { t = r[i]; r[i] = r[j]; r[j] = t }
-      m = (n % 2) ? r[int(n/2)] : (r[n/2 - 1] + r[n/2]) / 2
-      e = m * (ctx / 1000000)
-      if (e <= 0) exit 1
-      printf "%.2f %d", e, n
+      lo = r[0] * (ctx / 1000000)
+      hi = r[int(0.75 * (n - 1) + 0.5)] * (ctx / 1000000)
+      if (hi <= 0) exit 1
+      printf "%.2f %.2f %d", lo, hi, n
     }' "$turns"
 }
 
@@ -228,7 +231,11 @@ render() {
     # enough behind it to survive one unusual turn.
     if (est != "") {
       split(est, e, " ")
-      out = out sprintf(" %s[~$%s]%s", e[2] + 0 >= 3 ? rgb(96,165,250) : DIM rgb(96,165,250), e[1], RESET)
+      blue = (e[3] + 0 >= 3) ? rgb(96,165,250) : DIM rgb(96,165,250)
+      # Collapse to one figure when the floor and a working turn agree, which is
+      # what a session of short replies looks like.
+      if (e[1] == e[2]) out = out sprintf(" %s[~$%s]%s", blue, e[1], RESET)
+      else              out = out sprintf(" %s[~$%s–%s]%s", blue, e[1], e[2], RESET)
     }
 
     # The floating number. Age drives it, so a render landing at any moment gets

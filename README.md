@@ -3,9 +3,9 @@
 Hear what Claude Code costs you, and watch the context fill.
 
 ```
-Opus 5  xhigh  █░░░░░░░░░ 18%  182k / 1.00M  $9.76  [~$0.42]  +$0.03
-                                                       │        ╰─ rings, then fades over 4s
-                                                       ╰─ what the next message will cost
+Opus 5  xhigh  █░░░░░░░░░ 18%  182k / 1.00M  $9.76  [~$0.18–0.40]  +$0.03
+                                                          │           ╰─ rings, then fades over 4s
+                                                          ╰─ what the next message will cost
 ```
 
 It does not replace your statusline. It rides alongside the one you already run.
@@ -115,17 +115,25 @@ The dominant cost of your next message is re-reading the context you already hav
 most of the bill before Claude writes a word, which is exactly the number no interface shows you
 until the money is gone.
 
-`[~$0.42]` is that figure, in blue, before you press enter. It is learned from your own session
-rather than from a price table:
+`[~$0.18–0.40]` is that figure, in blue, before you press enter. It is learned from your own session
+rather than from a price table. `prompt_id` changes when a new prompt starts, so every completed turn
+yields one sample of dollars per million tokens of context — and the *ratio* is what carries to a
+larger window, not the dollar figure.
+
+It is a range because a single number cannot be honest. Turn cost spans an order of magnitude
+between "ok" and twenty tool calls — measured at 7.8× across one session — and nothing can know
+which one you are about to send:
 
 ```
-estimate = median(turn_cost ÷ turn_context) × current_context
+low  = cheapest turn observed × current context    one API call, driven purely by context size
+high = upper quartile         × current context    a real working turn
 ```
 
-`prompt_id` changes when a new prompt starts, so each completed turn yields one sample of dollars per
-million tokens of context. The *ratio* is what carries to a larger window, not the dollar figure.
-Median rather than mean, because one turn that read forty files should not set the expectation for
-the next.
+The floor is the useful half. It is what the message costs even if you type "ok", it is set entirely
+by how much context you are carrying, and it is precisely predictable — measured against a one-word
+reply it was out by a cent. Heavy turns still exceed the top of the range, which is exactly what a
+range admits and a single figure would not. When floor and working turn agree, it collapses to one
+number.
 
 That makes it model-agnostic, plan-agnostic, and immune to rate changes — it measures what your work
 actually costs instead of asserting what it should.
