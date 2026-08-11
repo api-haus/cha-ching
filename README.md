@@ -128,8 +128,12 @@ Median rather than mean, because one turn that read forty files should not set t
 the next.
 
 That makes it model-agnostic, plan-agnostic, and immune to rate changes — it measures what your work
-actually costs instead of asserting what it should. It stays blank until three turns have completed
-rather than showing a number it has not earned.
+actually costs instead of asserting what it should.
+
+It appears after your first completed turn, dimmed, because one turn is already a better guess than
+nothing. It goes full blue at three, when the median has enough behind it to survive one unusual
+turn. `cha-ching doctor` reports calibration per session — never totalled across them, since a total
+would claim ready while the session in front of you has nothing.
 
 **It cannot account for what you are typing.** The statusline payload carries `prompt_id` but never
 the draft text, so per-keystroke estimation is impossible — not awkward, absent. For the same reason

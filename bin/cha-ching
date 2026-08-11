@@ -181,17 +181,20 @@ estimate() {
   local turns="$1" ctx="$2"
   [ -r "$turns" ] || return 1
   [ "${ctx:-0}" -gt 0 ] || return 1
+  # Emits "<dollars> <samples>". One completed turn is already a better guess
+  # than nothing, so it shows from the first — the caller dims it until enough
+  # turns have landed for the median to mean anything.
   awk -v ctx="$ctx" '
     { r[n++] = $1 + 0 }
     END {
-      if (n < 3) exit 1                       # too few turns to be worth a number
+      if (n < 1) exit 1
       for (i = 0; i < n; i++)
         for (j = i + 1; j < n; j++)
           if (r[j] < r[i]) { t = r[i]; r[i] = r[j]; r[j] = t }
       m = (n % 2) ? r[int(n/2)] : (r[n/2 - 1] + r[n/2]) / 2
       e = m * (ctx / 1000000)
       if (e <= 0) exit 1
-      printf "%.2f", e
+      printf "%.2f %d", e, n
     }' "$turns"
 }
 
@@ -220,8 +223,13 @@ render() {
     }
     out = out sprintf(" %s$%.2f%s", DIM, cost, RESET)
 
-    # What the next message is likely to cost, before it is sent.
-    if (est != "") out = out sprintf(" %s[~$%s]%s", rgb(96,165,250), est, RESET)
+    # What the next message is likely to cost, before it is sent. Dim while a
+    # single turn is carrying the whole guess; full blue once the median has
+    # enough behind it to survive one unusual turn.
+    if (est != "") {
+      split(est, e, " ")
+      out = out sprintf(" %s[~$%s]%s", e[2] + 0 >= 3 ? rgb(96,165,250) : DIM rgb(96,165,250), e[1], RESET)
+    }
 
     # The floating number. Age drives it, so a render landing at any moment gets
     # the right colour rather than a fixed frame.
@@ -378,14 +386,26 @@ cmd_doctor() {
     [ "$ok" -gt 8 ] && printf '              many sessions — raising refreshInterval to 2 or 3 halves that\n'
   fi
 
-  local turns
-  turns=$(cat "$RUN"/cha-ching-*.turns 2>/dev/null | wc -l)
+  # Per session, never aggregated. Calibration belongs to one session's turn
+  # history, so a total across sessions would report ready while the session you
+  # are looking at has nothing.
   if [ "$ESTIMATE" = "0" ]; then
     printf '  estimate    off\n'
-  elif [ "$turns" -lt 3 ]; then
-    printf '  estimate    calibrating (%s of 3 turns needed before it shows a number)\n' "$turns"
   else
-    printf '  estimate    calibrated on %s recent turn(s)\n' "$turns"
+    local f n any=0
+    for f in "$RUN"/cha-ching-*.turns; do
+      [ -r "$f" ] || continue
+      n=$(wc -l < "$f")
+      [ "$n" -gt 0 ] || continue
+      any=1
+      f=${f##*/cha-ching-}; f=${f%.turns}
+      if [ "$n" -lt 3 ]; then
+        printf '  estimate    %.8s — %s turn(s), showing a provisional figure (dim until 3)\n' "$f" "$n"
+      else
+        printf '  estimate    %.8s — %s turn(s), calibrated\n' "$f" "$n"
+      fi
+    done
+    [ "$any" = 0 ] && printf '  estimate    no completed turns recorded yet in any session\n'
   fi
 }
 
