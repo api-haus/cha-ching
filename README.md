@@ -55,11 +55,14 @@ Code afterwards; `statusLine` is read at startup.
 To do it by hand instead, or to undo it:
 
 ```bash
-CC=~/.claude/plugins/cache/cha-ching/cha-ching/bin/cha-ching
+CC=$(find ~/.claude/plugins/cache/cha-ching -name cha-ching -type f -perm -u+x | head -1)
 "$CC" setup       # claim the slot, chaining whatever was there
 "$CC" doctor      # explain why it is quiet
 "$CC" uninstall   # give the slot back
 ```
+
+Installed plugins live under a version directory, so the path is
+`~/.claude/plugins/cache/cha-ching/cha-ching/<version>/bin/cha-ching` — hence the `find`.
 
 ## It composes
 
