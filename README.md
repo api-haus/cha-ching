@@ -3,9 +3,9 @@
 Hear what Claude Code costs you, and watch the context fill.
 
 ```
-Opus 5  xhigh  █░░░░░░░░░ 18%  182k / 1.00M  $9.76  [~$0.18–0.40]  +$0.03
-                                                          │           ╰─ rings, then fades over 4s
-                                                          ╰─ what the next message will cost
+Opus 5  xhigh  █░░░░░░░░░ 18%  182k / 1.00M  $9.76  [~$0.18]  +$0.03
+                                                       │        ╰─ rings, then fades over 4s
+                                                       ╰─ cost of submitting this context
 ```
 
 It does not replace your statusline. It rides alongside the one you already run.
@@ -100,8 +100,8 @@ shell.
 | `CHA_CHING_FADE` | `4` | seconds for the floating number to fade out |
 | `CHA_CHING_MIN` | `0.005` | spend below this is not worth a sound |
 | `CHA_CHING_BANDS` | `10` | announce context every N percent |
-| `CHA_CHING_ESTIMATE` | `1` | `0` hides the `[~$0.42]` next-message estimate |
-| `CHA_CHING_SAMPLES` | `6` | completed turns kept to calibrate that estimate |
+| `CHA_CHING_ESTIMATE` | `1` | `0` hides the `[~$0.18]` submit-cost figure |
+| `CHA_CHING_SAMPLES` | `6` | completed turns kept to calibrate it |
 | `CHA_CHING_SOUND` | bundled | path to your own wav |
 | `CHA_CHING_MUTE` | `0` | `1` keeps the number, drops the sound |
 
@@ -109,45 +109,53 @@ Cost updates once per API response, so a tool-heavy turn would ring a dozen time
 rate-limits the *ring*, not the accounting — spend during the quiet window accrues and lands as one
 weightier number. Nothing is dropped.
 
-## What the next message will cost
+## What it costs to submit
 
-The dominant cost of your next message is re-reading the context you already have. At 800k that is
-most of the bill before Claude writes a word, which is exactly the number no interface shows you
-until the money is gone.
+`[~$0.18]` is the bare cost of sending your current context, before Claude writes a word. The whole
+window is re-read on every request, so this is already spent the moment you press enter — it is the
+price of the conversation you are carrying, not of the question you are asking.
 
-`[~$0.18–0.40]` is that figure, in blue, before you press enter. It is learned from your own session
-rather than from a price table. `prompt_id` changes when a new prompt starts, so every completed turn
-yields one sample of dollars per million tokens of context — and the *ratio* is what carries to a
-larger window, not the dollar figure.
+**It deliberately does not predict the turn.** Whether Claude replies in one word or makes twenty
+tool calls is a property of the work, not of the context, and no history predicts it. An earlier
+version showed a range whose upper bound was exactly that guess; it was removed. The number you can
+know is the one that is fixed before the request is sent.
 
-It is a range because a single number cannot be honest. Turn cost spans an order of magnitude
-between "ok" and twenty tool calls — measured at 7.8× across one session — and nothing can know
-which one you are about to send:
+It is learned rather than looked up. `prompt_id` changes when a new prompt starts, so each completed
+turn yields one sample of dollars per million tokens of context, and the cheapest turn observed
+approximates a bare submit — one API call, a submit plus a few tokens of reply. Turns that did real
+work are strictly dearer and cannot drag it down.
+
+Checked against first principles on a live session: the learned figure said `$0.18` where
+`332,258 tokens × $0.50/M` gives `$0.17`, with no price table anywhere in the plugin. That is the
+point — it stays correct across models, plans and rate changes because it measures instead of
+asserting.
+
+It appears after your first completed turn, dimmed, and goes full blue at three.
+`cha-ching doctor` reports calibration per session, never totalled across them.
+
+**It cannot account for what you are typing.** The payload carries `prompt_id` but never the draft
+text. For the same reason the figure cannot appear only while you type: measured over a 68-second
+window across two dozen live sessions, every render arrived on the `refreshInterval` timer and
+keystrokes produced none at all. There is no typing signal to key off.
+
+### When submission costs twenty times as much
+
+A cache read is `$0.50` per million tokens. A cache *write* on the 1-hour TTL is `$10`. So if the
+prefix is invalidated — an MCP server connecting or disconnecting changes the tool list, or the TTL
+simply lapses — the next request re-writes the entire window instead of re-reading it.
+
+Observed on a live session, a one-word reply:
 
 ```
-low  = cheapest turn observed × current context    one API call, driven purely by context size
-high = upper quartile         × current context    a real working turn
+normal turn      cache_read  324,345 × $0.50/M  =  $0.162
+                 cache_write   1,733 × $10.00/M =  $0.017   → $0.180
+after a rebuild  cache_read   26,289 × $0.50/M  =  $0.013
+                 cache_write 301,730 × $10.00/M =  $3.017   → $3.030
 ```
 
-The floor is the useful half. It is what the message costs even if you type "ok", it is set entirely
-by how much context you are carrying, and it is precisely predictable — measured against a one-word
-reply it was out by a cent. Heavy turns still exceed the top of the range, which is exactly what a
-range admits and a single figure would not. When floor and working turn agree, it collapses to one
-number.
-
-That makes it model-agnostic, plan-agnostic, and immune to rate changes — it measures what your work
-actually costs instead of asserting what it should.
-
-It appears after your first completed turn, dimmed, because one turn is already a better guess than
-nothing. It goes full blue at three, when the median has enough behind it to survive one unusual
-turn. `cha-ching doctor` reports calibration per session — never totalled across them, since a total
-would claim ready while the session in front of you has nothing.
-
-**It cannot account for what you are typing.** The statusline payload carries `prompt_id` but never
-the draft text, so per-keystroke estimation is impossible — not awkward, absent. For the same reason
-the estimate cannot appear only while you type: measured over a 68-second window across two dozen
-live sessions, every render arrived on the `refreshInterval` timer and keystrokes produced no render
-at all. There is no typing signal to key off.
+Seventeen times a normal turn, for the word "pong". Nothing predicts it, because it is not a property
+of your message. It is the reason the estimate takes the cheapest turn rather than an average: a
+rebuild is an event, not a working pattern, and a minimum ignores it.
 
 ## Cost of running it
 

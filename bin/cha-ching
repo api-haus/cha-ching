@@ -181,23 +181,23 @@ estimate() {
   local turns="$1" ctx="$2"
   [ -r "$turns" ] || return 1
   [ "${ctx:-0}" -gt 0 ] || return 1
-  # Emits "<low> <high> <samples>". A single figure cannot be honest here: turn
-  # cost spans an order of magnitude between "ok" and twenty tool calls, and
-  # nothing can know which one you are about to send. So the floor is the
-  # cheapest turn observed — one API call, driven purely by context size and
-  # therefore genuinely predictable — and the top is the upper quartile, a real
-  # working turn. Heavy turns still exceed it, and that is what a range says.
+  # Emits "<dollars> <samples>" — the bare cost of submitting this context, and
+  # nothing else.
+  #
+  # What the turn then does with it is not estimable: whether Claude answers in
+  # one word or makes twenty tool calls is a property of the work, not of the
+  # context, and no history predicts it. Submission is the part that IS fixed
+  # the moment you press enter — the whole window re-read at the cache rate,
+  # already paid for before a single output token exists.
+  #
+  # The cheapest turn observed approximates it, because the cheapest turn is one
+  # API call: a submit plus a few tokens of reply. Turns that did more work, and
+  # turns that hit a cache rebuild, are strictly dearer and cannot drag it down.
   awk -v ctx="$ctx" '
-    { r[n++] = $1 + 0 }
+    { if (n == 0 || $1 + 0 < lo) lo = $1 + 0; n++ }
     END {
-      if (n < 1) exit 1
-      for (i = 0; i < n; i++)
-        for (j = i + 1; j < n; j++)
-          if (r[j] < r[i]) { t = r[i]; r[i] = r[j]; r[j] = t }
-      lo = r[0] * (ctx / 1000000)
-      hi = r[int(0.75 * (n - 1) + 0.5)] * (ctx / 1000000)
-      if (hi <= 0) exit 1
-      printf "%.2f %.2f %d", lo, hi, n
+      if (n < 1 || lo <= 0) exit 1
+      printf "%.2f %d", lo * (ctx / 1000000), n
     }' "$turns"
 }
 
@@ -231,11 +231,7 @@ render() {
     # enough behind it to survive one unusual turn.
     if (est != "") {
       split(est, e, " ")
-      blue = (e[3] + 0 >= 3) ? rgb(96,165,250) : DIM rgb(96,165,250)
-      # Collapse to one figure when the floor and a working turn agree, which is
-      # what a session of short replies looks like.
-      if (e[1] == e[2]) out = out sprintf(" %s[~$%s]%s", blue, e[1], RESET)
-      else              out = out sprintf(" %s[~$%s–%s]%s", blue, e[1], e[2], RESET)
+      out = out sprintf(" %s[~$%s]%s", (e[2] + 0 >= 3) ? rgb(96,165,250) : DIM rgb(96,165,250), e[1], RESET)
     }
 
     # The floating number. Age drives it, so a render landing at any moment gets
