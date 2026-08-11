@@ -56,7 +56,7 @@ cmd_statusline() {
   local payload model effort used size cost session
   payload=$(cat)
 
-  IFS=$'\t' read -r model effort used size cost session prompt < <(
+  IFS=$'\t' read -r model effort used size cost session prompt cwrite cread transcript < <(
     printf '%s' "$payload" | jq -r '
       [ (.model.display_name // "?"),
         (.effort.level // "-"),
@@ -64,17 +64,21 @@ cmd_statusline() {
         (.context_window.context_window_size // 0),
         (.cost.total_cost_usd // 0),
         (.session_id // ""),
-        (.prompt_id // "-")
+        (.prompt_id // "-"),
+        (.context_window.current_usage.cache_creation_input_tokens // 0),
+        (.context_window.current_usage.cache_read_input_tokens // 0),
+        (.transcript_path // "")
       ] | @tsv' 2>/dev/null
   )
   [ -n "${model:-}" ] || exit 0
 
-  local now state last pending ring_ts shown shown_ts prev_prompt turn_cost turn_ctx ring=0
+  local now state last pending ring_ts shown shown_ts prev_prompt turn_cost turn_ctx last_call ttl ring=0
   now=$(now_s)
   state="$RUN/cha-ching-${session:-nosession}.state"
 
   last=""; pending=0; ring_ts=0; shown=0; shown_ts=0; prev_prompt="-"; turn_cost=""; turn_ctx=0
-  [ -r "$state" ] && IFS=' ' read -r last pending ring_ts shown shown_ts prev_prompt turn_cost turn_ctx < "$state" 2>/dev/null
+  last_call=0; ttl=0
+  [ -r "$state" ] && IFS=' ' read -r last pending ring_ts shown shown_ts prev_prompt turn_cost turn_ctx last_call ttl < "$state" 2>/dev/null
 
   if [ -z "${last:-}" ]; then
     # First sight. Adopt the total silently — announcing a session's whole
@@ -84,6 +88,10 @@ cmd_statusline() {
     # Every bump accrues. The ring is rate-limited, not the accounting, so a
     # tool-heavy turn lands as a few weighty numbers instead of a stream of
     # small ones, and nothing is ever dropped.
+    # A bump means a request completed, which is also the moment the cache was
+    # last touched — and therefore when its clock restarted.
+    awk -v c="$cost" -v l="$last" 'BEGIN { exit !(c - l > 0) }' && last_call=$now
+
     pending=$(awk -v p="${pending:-0}" -v c="$cost" -v l="$last" \
       'BEGIN { d = c - l; printf "%.6f", p + (d > 0 ? d : 0) }')
 
@@ -103,23 +111,32 @@ cmd_statusline() {
   # Store the ratio, not the cost — that is what carries to a bigger window.
   if [ "$prompt" != "$prev_prompt" ]; then
     if [ -n "${turn_cost:-}" ] && [ "${turn_ctx:-0}" -gt 1000 ]; then
+      # A turn whose last request wrote more than it read rebuilt the cache. That
+      # is an event, not a working pattern, so it is filed separately: it must
+      # never set the warm expectation, and it is the only honest measure of what
+      # a rebuild costs.
+      local bucket=turns
+      [ "${cwrite:-0}" -gt "${cread:-0}" ] && bucket=rebuilds
       awk -v c0="$turn_cost" -v c1="$cost" -v ctx="$turn_ctx" \
         'BEGIN { d = c1 - c0; if (d > 0) printf "%.6f\n", d / (ctx / 1000000) }' \
-        >> "$RUN/cha-ching-${session:-nosession}.turns" 2>/dev/null || true
+        >> "$RUN/cha-ching-${session:-nosession}.$bucket" 2>/dev/null || true
       # Keep only recent turns: a session's shape changes as the work changes.
-      tail -n "$SAMPLES" "$RUN/cha-ching-${session:-nosession}.turns" \
-        > "$RUN/cha-ching-${session:-nosession}.turns.tmp" 2>/dev/null &&
-        mv -f "$RUN/cha-ching-${session:-nosession}.turns.tmp" \
-              "$RUN/cha-ching-${session:-nosession}.turns" 2>/dev/null || true
+      tail -n "$SAMPLES" "$RUN/cha-ching-${session:-nosession}.$bucket" \
+        > "$RUN/cha-ching-${session:-nosession}.$bucket.tmp" 2>/dev/null &&
+        mv -f "$RUN/cha-ching-${session:-nosession}.$bucket.tmp" \
+              "$RUN/cha-ching-${session:-nosession}.$bucket" 2>/dev/null || true
     fi
     prev_prompt=$prompt
     turn_cost=$cost
     turn_ctx=$used
+    # Which TTL this session is on decides when the window goes cold, and only
+    # the transcript names it. Read once per turn, never per render.
+    [ -n "${transcript:-}" ] && ttl=$(detect_ttl "$transcript" || printf '%s' "${ttl:-0}")
   fi
 
-  printf '%s %s %s %s %s %s %s %s\n' "$cost" "$pending" "$ring_ts" "$shown" "$shown_ts" \
-    "$prev_prompt" "${turn_cost:-$cost}" "${turn_ctx:-$used}" > "$state.tmp" 2>/dev/null &&
-    mv -f "$state.tmp" "$state" 2>/dev/null || true
+  printf '%s %s %s %s %s %s %s %s %s %s\n' "$cost" "$pending" "$ring_ts" "$shown" "$shown_ts" \
+    "$prev_prompt" "${turn_cost:-$cost}" "${turn_ctx:-$used}" "${last_call:-0}" "${ttl:-0}" \
+    > "$state.tmp" 2>/dev/null && mv -f "$state.tmp" "$state" 2>/dev/null || true
 
   # Context, parked where the band hook can read it.
   printf '%s %s\n' "$used" "$size" > "$RUN/cha-ching-${session:-nosession}.ctx" 2>/dev/null || true
@@ -133,9 +150,14 @@ cmd_statusline() {
     # Most of those renders have nothing new to say, so the line is cached and
     # only rebuilt when something it depends on moves. A fade in progress
     # changes the line every frame and is never cached.
-    local cache key fading=0 age fade_int=${FADE%.*}
+    local cache key fading=0 age fade_int=${FADE%.*} minute=0
     cache="$RUN/cha-ching-${session:-nosession}.line"
-    key="$used|$size|$cost|$prompt"
+    # The cache clock moves on its own, so the key carries a minute counter —
+    # otherwise a window could go cold behind a cached line that still claims it
+    # is warm. One extra render a minute, not one a second.
+    [ "${ttl:-0}" != "0" ] && [ "${last_call%.*}" != "0" ] &&
+      minute=$(( ( ${now%.*} - ${last_call%.*} ) / 60 ))
+    key="$used|$size|$cost|$prompt|$minute"
 
     if [ "${shown_ts%.*}" != "0" ]; then
       age=$(( ${now%.*} - ${shown_ts%.*} ))
@@ -150,7 +172,7 @@ cmd_statusline() {
 
     if [ -z "$segment" ]; then
       local est=""
-      [ "$ESTIMATE" != "0" ] && est=$(estimate "$RUN/cha-ching-${session:-nosession}.turns" "$used" 2>/dev/null)
+      [ "$ESTIMATE" != "0" ] && est=$(estimate "${session:-nosession}" "$used" "${last_call:-0}" "${ttl:-0}" "$now" 2>/dev/null)
       segment=$(render "$model" "$effort" "$used" "$size" "$cost" "$shown" "$shown_ts" "$now" "${est:-}")
       [ "$fading" = 0 ] && {
         printf '%s\n%s\n' "$key" "$segment" > "$cache.tmp" 2>/dev/null &&
@@ -177,27 +199,62 @@ cmd_statusline() {
 # window size — so what carries between turns is the ratio, dollars per million
 # tokens of context, not the dollar figure itself. Median rather than mean: one
 # turn that read forty files should not set the expectation for the next.
+# Which prompt-cache TTL this session is on. The statusline payload gives only a
+# flat cache_creation figure, but the transcript breaks it out by TTL, so the
+# answer is read from there — once per turn, never per render.
+detect_ttl() {
+  local t="$1" line
+  [ -r "$t" ] || return 1
+  if command -v tac >/dev/null 2>&1; then
+    line=$(tac "$t" 2>/dev/null | grep -m1 'ephemeral_1h_input_tokens')
+  else
+    line=$(tail -r "$t" 2>/dev/null | grep -m1 'ephemeral_1h_input_tokens')
+  fi
+  [ -n "$line" ] || return 1
+  printf '%s' "$line" | jq -r '
+    (.message.usage.cache_creation // {}) as $c
+    | if   ($c.ephemeral_1h_input_tokens // 0) > 0 then 3600
+      elif ($c.ephemeral_5m_input_tokens // 0) > 0 then 300
+      else empty end' 2>/dev/null
+}
+
+# Emits "<dollars> <state> <seconds_left> <samples>" — the bare cost of
+# submitting this context, and how long that price holds.
+#
+# What the turn then does is not estimable: whether Claude answers in one word or
+# makes twenty tool calls is a property of the work, not of the context. But
+# submission itself is fixed the moment you press enter, and its price has two
+# values, not one. A cached window is re-READ at the cache-read rate. An expired
+# one is re-WRITTEN, twenty times dearer on the 1-hour TTL, and which of the two
+# you get is knowable: the clock started when the last request completed.
+#
+# Warm cost comes from the cheapest ordinary turn — one API call, a submit plus a
+# few tokens of reply. Cold cost comes from an observed rebuild if this session
+# has suffered one, and otherwise from the write/read price ratio.
 estimate() {
-  local turns="$1" ctx="$2"
+  local sess="$1" ctx="$2" last_call="$3" ttl="$4" now="$5"
+  local turns="$RUN/cha-ching-$sess.turns" cold="$RUN/cha-ching-$sess.rebuilds"
   [ -r "$turns" ] || return 1
   [ "${ctx:-0}" -gt 0 ] || return 1
-  # Emits "<dollars> <samples>" — the bare cost of submitting this context, and
-  # nothing else.
-  #
-  # What the turn then does with it is not estimable: whether Claude answers in
-  # one word or makes twenty tool calls is a property of the work, not of the
-  # context, and no history predicts it. Submission is the part that IS fixed
-  # the moment you press enter — the whole window re-read at the cache rate,
-  # already paid for before a single output token exists.
-  #
-  # The cheapest turn observed approximates it, because the cheapest turn is one
-  # API call: a submit plus a few tokens of reply. Turns that did more work, and
-  # turns that hit a cache rebuild, are strictly dearer and cannot drag it down.
-  awk -v ctx="$ctx" '
+  awk -v ctx="$ctx" -v coldf="$cold" -v lc="$last_call" -v ttl="$ttl" -v now="$now" '
     { if (n == 0 || $1 + 0 < lo) lo = $1 + 0; n++ }
     END {
       if (n < 1 || lo <= 0) exit 1
-      printf "%.2f %d", lo * (ctx / 1000000), n
+      warm = lo * (ctx / 1000000)
+
+      # A measured rebuild beats an asserted ratio. Fall back to write/read only
+      # when this session has not yet paid for one.
+      cr = 0
+      while ((getline v < coldf) > 0) if (cr == 0 || v + 0 < cr) cr = v + 0
+      close(coldf)
+      cold = (cr > 0) ? cr * (ctx / 1000000) : warm * (ttl >= 3600 ? 20 : 12.5)
+
+      if (lc + 0 <= 0 || ttl + 0 <= 0) { printf "%.2f warm 0 %d", warm, n; exit }
+
+      left = ttl - (now - lc)
+      if      (left <= 0)  printf "%.2f cold 0 %d", cold, n
+      else if (left < 300) printf "%.2f expiring %d %d", warm, left, n
+      else                 printf "%.2f warm %d %d", warm, left, n
     }' "$turns"
 }
 
@@ -229,9 +286,18 @@ render() {
     # What the next message is likely to cost, before it is sent. Dim while a
     # single turn is carrying the whole guess; full blue once the median has
     # enough behind it to survive one unusual turn.
+    # Blue while the window is cached, amber as the clock runs down with the
+    # minutes left, red once it has lapsed — where the figure is no longer a
+    # re-read but a full rewrite, and the arrow says so.
     if (est != "") {
       split(est, e, " ")
-      out = out sprintf(" %s[~$%s]%s", (e[2] + 0 >= 3) ? rgb(96,165,250) : DIM rgb(96,165,250), e[1], RESET)
+      young = (e[4] + 0 < 3) ? DIM : ""
+      if (e[2] == "cold")
+        out = out sprintf(" %s%s[~$%s ⟳]%s", young, rgb(248,113,113), e[1], RESET)
+      else if (e[2] == "expiring")
+        out = out sprintf(" %s%s[~$%s · %dm]%s", young, rgb(251,191,36), e[1], int(e[3] / 60) + 1, RESET)
+      else
+        out = out sprintf(" %s%s[~$%s]%s", young, rgb(96,165,250), e[1], RESET)
     }
 
     # The floating number. Age drives it, so a render landing at any moment gets

@@ -130,7 +130,7 @@ Checked against first principles on a live session: the learned figure said `$0.
 point — it stays correct across models, plans and rate changes because it measures instead of
 asserting.
 
-It appears after your first completed turn, dimmed, and goes full blue at three.
+It appears after your first completed turn, dimmed, and reaches full colour at three.
 `cha-ching doctor` reports calibration per session, never totalled across them.
 
 **It cannot account for what you are typing.** The payload carries `prompt_id` but never the draft
@@ -138,13 +138,27 @@ text. For the same reason the figure cannot appear only while you type: measured
 window across two dozen live sessions, every render arrived on the `refreshInterval` timer and
 keystrokes produced none at all. There is no typing signal to key off.
 
-### When submission costs twenty times as much
+### The price has two values, and which one you get is knowable
 
-A cache read is `$0.50` per million tokens. A cache *write* on the 1-hour TTL is `$10`. So if the
-prefix is invalidated — an MCP server connecting or disconnecting changes the tool list, or the TTL
-simply lapses — the next request re-writes the entire window instead of re-reading it.
+A cache read is `$0.50` per million tokens. A cache *write* on the 1-hour TTL is `$10` — twenty times
+dearer. So submitting the same window costs one of two very different amounts depending on whether
+the cache is still alive, and cha-ching tracks which:
 
-Observed on a live session, a one-word reply:
+```
+[~$0.19]         blue    cached. re-read at read rate.
+[~$0.19 · 4m]    amber   4 minutes before it lapses
+[~$3.16 ⟳]       red     lapsed. the next submit rewrites the whole window.
+```
+
+The clock starts when the last request completed, and the TTL is read from the transcript, which
+breaks `cache_creation` out into `ephemeral_1h_input_tokens` and `ephemeral_5m_input_tokens`. The
+statusline payload carries only a flat total, so this is the one thing read from disk — once per
+turn, never per render.
+
+The cold figure prefers a rebuild this session has actually suffered over an asserted ratio. Measured
+against a real one: predicted `$3.16`, paid `$3.030`.
+
+Because that rebuild is what a lapse costs. Observed on a live session, for a one-word reply:
 
 ```
 normal turn      cache_read  324,345 × $0.50/M  =  $0.162
@@ -153,9 +167,10 @@ after a rebuild  cache_read   26,289 × $0.50/M  =  $0.013
                  cache_write 301,730 × $10.00/M =  $3.017   → $3.030
 ```
 
-Seventeen times a normal turn, for the word "pong". Nothing predicts it, because it is not a property
-of your message. It is the reason the estimate takes the cheapest turn rather than an average: a
-rebuild is an event, not a working pattern, and a minimum ignores it.
+Seventeen times a normal turn, for the word "pong". A lapsed TTL is one way to get there. So is
+anything that changes the prompt prefix — an MCP server connecting or disconnecting rewrites the tool
+list, and every cached token behind it has to be paid for again. That one is not predictable, which
+is why rebuild turns are filed separately and can never drag the warm figure down.
 
 ## Cost of running it
 
