@@ -98,18 +98,44 @@ shell.
 |---|---|---|
 | `RTC_CHAIN` | — | your statusline command; gets the same payload, output appended |
 | `RTC_SEGMENT` | `1` | `0` renders nothing of ours — harvest and chain only |
+| `RTC_RING` | `immediate` | what releases the sound — see below |
+| `RTC_THRESHOLD` | `5` | dollars per ring under `cumulative_threshold` |
 | `RTC_COOLDOWN` | `3` | seconds between rings; spend in between accrues into the next one |
 | `RTC_FADE` | `4` | seconds for the floating number to fade out |
 | `RTC_MIN` | `0.005` | spend below this is not worth a sound |
 | `RTC_BANDS` | `10` | announce context every N percent |
 | `RTC_ESTIMATE` | `1` | `0` hides the `[~$0.18]` submit-cost figure |
-| `RTC_SAMPLES` | `6` | completed turns kept to calibrate it |
+| `RTC_SAMPLES` | `12` | recent requests kept to calibrate it |
 | `RTC_SOUND` | bundled | path to your own wav |
 | `RTC_MUTE` | `0` | `1` keeps the number, drops the sound |
 
-Cost updates once per API response, so a tool-heavy turn would ring a dozen times. The cooldown
-rate-limits the *ring*, not the accounting — spend during the quiet window accrues and lands as one
-weightier number. Nothing is dropped.
+## When it rings
+
+Cost updates once per API response, so a tool-heavy turn moves money a dozen times. What that should
+sound like depends on what you are doing, so `RTC_RING` picks:
+
+| `RTC_RING` | rings |
+|---|---|
+| `immediate` | on every bump over `RTC_MIN`, at most one per `RTC_COOLDOWN` |
+| `cumulative_threshold` | once per `RTC_THRESHOLD` dollars, however long that takes |
+| `on_halt` | when the turn hands back — work submitted, question asked, permission wanted |
+
+`immediate` is the default and is a live wire: you hear the session working, and a run of tool calls
+you did not expect announces itself while it is happening.
+
+`cumulative_threshold` is for long unattended runs, where the immediate ring becomes a metronome you
+stop hearing. One ring per `$5` is a budget you notice instead.
+
+`on_halt` inverts it. Nothing during the work, one ring at the moment the turn needs you, which is
+the moment you would want to look up anyway. Wired to the `Stop` and `Notification` hooks, so a
+permission prompt rings too — that is Claude waiting on you with money already spent.
+
+Rate-limiting is applied to the ring, never to the accounting. Spend during a quiet stretch accrues
+and lands with the next one, and a threshold carries its remainder, so every `$5` spent is one ring
+however the bumps happened to fall.
+
+The floating number keeps its own rhythm in all three. It is free — it costs a glance you are already
+giving the statusline — while a sound interrupts, so only the sound is worth moving.
 
 ## What it costs to submit
 

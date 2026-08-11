@@ -45,17 +45,18 @@ has already happened once.
 ## Layout
 
 ```
-bin/rtc                      everything — one bash script, five subcommands
-hooks/hooks.json             UserPromptSubmit -> ${CLAUDE_PLUGIN_ROOT}/bin/rtc hook
+bin/rtc                      everything — one bash script, six subcommands
+hooks/hooks.json             UserPromptSubmit -> rtc hook; Stop, Notification -> rtc halt
 commands/setup.md            /realtokencost:setup
 share/cash-register.wav      CC0, see share/ATTRIBUTION.md
 .claude-plugin/plugin.json   plugin manifest
 .claude-plugin/marketplace.json   single-plugin marketplace, source "./"
 ```
 
-`rtc statusline` is what `statusLine.command` runs. `rtc hook`, `setup`, `uninstall`, `doctor` are
-the rest. `doctor` exists to answer "why is it quiet" without a debugging session — extend it when you
-add a way for things to be quiet.
+`rtc statusline` is what `statusLine.command` runs. `rtc hook`, `halt`, `setup`, `uninstall`,
+`doctor` are the rest. `doctor` exists to answer "why is it quiet" without a debugging session —
+extend it when you add a way for things to be quiet. Three ring modes are three such ways, which is
+why each prints its own line there.
 
 ## Runtime state
 
@@ -69,16 +70,20 @@ Per session under `$XDG_RUNTIME_DIR` (falling back to `TMPDIR`), keyed by `sessi
 | `rtc-<id>.ctx` | `used size`, the bridge the hook reads |
 | `rtc-<id>.line` | cache key on line 1, rendered segment on line 2 |
 | `rtc-<id>.band` | highest context band already announced |
+| `rtc-<id>.halt` | the turn handed back; consumed by the next render |
 | `rtc-<id>.nudged` | set once when told to run setup |
 
 State field order, positional, read with one `read`:
 
 ```
-cost pending ring_ts shown shown_ts prev_prompt turn_cost turn_ctx last_call ttl
+cost pending ring_ts shown shown_ts prev_prompt turn_cost turn_ctx last_call ttl ring_acc
 ```
 
-Adding a field means appending and widening the `read` — never reordering. Old state files are read
-by new binaries in the wild.
+Adding a field means appending and widening the `read` — never reordering, and never widening one
+without the other: `read` puts everything it has no variable left for into the last one, so a write
+that outruns its `read` does not lose the new field, it corrupts the previous one. Old state files
+are read by new binaries in the wild, and the missing trailing field comes back empty rather than
+absent, so every new field needs a default after the `read`.
 
 Across sessions, `$XDG_CACHE_HOME/realtokencost/rate-<model_id>` holds what a bare submit costs for
 that model. It is a property of the model, not the session, so a new session inherits it and shows a
@@ -99,6 +104,14 @@ estimate from.
 **Showing the figure only while typing.** Needs a typing signal. Measured over 68 seconds across two
 dozen live sessions, every render arrived on the `refreshInterval` timer; keystrokes produced none.
 The busiest session showed 7 sub-second gaps in 112, all tool activity.
+
+**Ringing from the `Stop` hook itself.** It looks like an obvious simplification and it announces
+nothing. No hook payload carries cost, so the money would have to come from the state file, and at
+the instant `Stop` fires the statusline has not been re-run with the completed request's cost in it.
+On a one-request turn that request is the whole spend, and the hook would read zero. So the hook
+leaves a marker and the next render rings, with the real number. That render arrives: idle sessions
+keep rendering on the `refreshInterval` timer — checked across two dozen at once, every `.state` file
+had been rewritten within the last second while the `.line` caches beside them were minutes old.
 
 **Averaging the estimate.** It takes the cheapest observed ratio, not a mean or median. A minimum
 cannot be dragged up by a tool-heavy turn or by a $3 cache rebuild, which is the whole point.
@@ -130,6 +143,17 @@ still claims it is warm.
 Anything added to the render path is paid once per second per session. Weigh it accordingly.
 
 ## The sound
+
+Two accumulators carry money forward, because the eye and the ear are not on the same budget.
+`pending` is money the floating number has not shown yet and flushes on the same beat it always has,
+in every mode. `ring_acc` is money the ring has not announced, and what releases it is `RTC_RING`:
+`immediate` (`MIN` plus `COOLDOWN`), `cumulative_threshold` (`RTC_THRESHOLD` dollars, remainder
+carried by `%` so the rings do not drift quieter than asked), `on_halt` (a halt marker is present).
+In `immediate` the two flush together and the behaviour is what it was before modes existed.
+
+The whole decision — what arrived, what each accumulator now holds, whether either is due — is one
+`awk`, deliberately. It replaced four, and the render path is paid once a second for every open
+session: measured 16ms before, 12.5ms after.
 
 `share/cash-register.wav` carries **400ms of silence in front**, and that is not padding to be
 trimmed. Audio sinks suspend when idle and waking one swallows the start of a short sample — badly

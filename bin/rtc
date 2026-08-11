@@ -14,6 +14,7 @@
 #
 #   rtc statusline   harvest, render, chain   (what statusLine.command runs)
 #   rtc hook         context band warnings    (wired by the plugin)
+#   rtc halt         mark a turn handing back (wired by the plugin)
 #   rtc setup        claim the statusLine slot, keeping what was there
 #   rtc uninstall    give it back
 #   rtc doctor       explain why it is quiet
@@ -53,6 +54,20 @@ MIN=${RTC_MIN:-0.005}        # spend below this is not worth a sound
 BANDS=${RTC_BANDS:-10}       # announce context every N percent
 ESTIMATE=${RTC_ESTIMATE:-1}  # 0 hides the [~$0.42] next-message estimate
 SAMPLES=${RTC_SAMPLES:-12}   # recent requests kept to calibrate the estimate
+
+# What releases the ring. The money is accounted the same way in all three —
+# only the moment it is announced moves.
+#
+#   immediate             every bump over MIN, at most one ring per COOLDOWN
+#   cumulative_threshold  once per THRESHOLD dollars, however long that takes
+#   on_halt               when the turn hands back: work submitted, question
+#                         asked, permission wanted
+#
+# The floating number keeps its own rhythm in every mode. It is free — it costs
+# a glance you were already giving the statusline — whereas a sound interrupts,
+# so the two do not have to fire together.
+RING=${RTC_RING:-immediate}
+THRESHOLD=${RTC_THRESHOLD:-5}
 
 die() { printf '%s\n' "$*" >&2; exit 1; }
 
@@ -109,13 +124,25 @@ cmd_statusline() {
   # spending two turns rediscovering a constant.
   local ratefile="$CACHE_DIR/rate-${modelid:-unknown}"
 
-  local now state last pending ring_ts shown shown_ts prev_prompt turn_cost turn_ctx last_call ttl ring=0
+  local now state last pending ring_ts shown shown_ts prev_prompt turn_cost turn_ctx last_call ttl
+  local ring_acc halt halted=0 pulse=0 ring=0 bump money carry=0
   now=$(now_s)
   state="$RUN/rtc-${session:-nosession}.state"
 
   last=""; pending=0; ring_ts=0; shown=0; shown_ts=0; prev_prompt="-"; turn_cost=""; turn_ctx=0
-  last_call=0; ttl=0
-  [ -r "$state" ] && IFS=' ' read -r last pending ring_ts shown shown_ts prev_prompt turn_cost turn_ctx last_call ttl < "$state" 2>/dev/null
+  last_call=0; ttl=0; ring_acc=0
+  [ -r "$state" ] && IFS=' ' read -r last pending ring_ts shown shown_ts prev_prompt turn_cost turn_ctx last_call ttl ring_acc < "$state" 2>/dev/null
+  # A state file written before the ring had modes stops at ttl, and read leaves
+  # the field it never wrote empty rather than absent.
+  [ -n "${ring_acc:-}" ] || ring_acc=0
+
+  # The turn handed back while we were not looking. Consumed on sight whether or
+  # not it becomes a ring — it happened once, and if no money moved with it there
+  # is nothing to announce.
+  if [ "$RING" = on_halt ]; then
+    halt="$RUN/rtc-${session:-nosession}.halt"
+    [ -e "$halt" ] && { halted=1; rm -f "$halt" 2>/dev/null || true; }
+  fi
 
   # A session knows nothing about its own context until its first response lands,
   # so a turn that opened before that has 0 recorded against it and would be
@@ -129,29 +156,43 @@ cmd_statusline() {
     # accumulated spend as a single hit would be a lie.
     :
   else
-    # Every bump accrues. The ring is rate-limited, not the accounting, so a
-    # tool-heavy turn lands as a few weighty numbers instead of a stream of
-    # small ones, and nothing is ever dropped.
+    # Every bump accrues, into two accumulators that are released on different
+    # terms. `pending` is money the eye has not been shown; `ring_acc` is money
+    # the ear has not been told about. Rate-limiting is applied to the release,
+    # never to the accounting, so a tool-heavy turn lands as a few weighty
+    # numbers instead of a stream of small ones and nothing is ever dropped.
     # A bump means a request completed, which is also the moment the cache was
     # last touched — and therefore when its clock restarted. It is also a
     # measurement: this much money bought a re-read of this much context.
-    local bump
-    bump=$(awk -v c="$cost" -v l="$last" 'BEGIN { d = c - l; printf "%.6f", (d > 0 ? d : 0) }')
-    if awk -v b="$bump" 'BEGIN { exit !(b > 0) }'; then
+    #
+    # One awk decides all of it. This runs every second for every open session,
+    # and each of these used to be a process of its own.
+    money=$(awk -v c="$cost" -v l="$last" -v p="${pending:-0}" -v a="${ring_acc:-0}" \
+                -v min="$MIN" -v cd="$COOLDOWN" -v thr="$THRESHOLD" -v mode="$RING" \
+                -v halted="$halted" -v now="$now" -v sts="${shown_ts:-0}" -v rts="${ring_ts:-0}" '
+      BEGIN {
+        d = c - l; if (d < 0) d = 0
+        p += d; a += d
+        carry = 0
+        pulse = (p >= min && now - sts >= cd)
+        # What survives a ring. A threshold keeps its remainder: the crossing
+        # rarely lands on the number exactly, and zeroing what is left over
+        # would drop a fraction of a ring every time and drift quieter than the
+        # threshold asked for. The other two modes have announced everything.
+        if      (mode == "cumulative_threshold") { ring = (a >= thr); if (ring) carry = a % thr }
+        else if (mode == "on_halt")                ring = (halted && a >= min)
+        else                                       ring = (a >= min && now - rts >= cd)
+        printf "%.6f %.6f %.6f %d %d %.6f", d, p, a, pulse, ring, carry
+      }')
+    IFS=' ' read -r bump pending ring_acc pulse ring carry <<< "$money"
+
+    if [ "$bump" != "0.000000" ]; then
       last_call=$now
       record_sample "$bump" "$used" "$cwrite" "$cread" "${session:-nosession}" "$ratefile"
     fi
 
-    pending=$(awk -v p="${pending:-0}" -v b="$bump" 'BEGIN { printf "%.6f", p + b }')
-
-    if awk -v p="$pending" -v m="$MIN" -v n="$now" -v r="${ring_ts:-0}" -v cd="$COOLDOWN" \
-        'BEGIN { exit !(p >= m && n - r >= cd) }'; then
-      ring=1
-      shown=$pending
-      shown_ts=$now
-      ring_ts=$now
-      pending=0
-    fi
+    if [ "$pulse" = 1 ]; then shown=$pending; shown_ts=$now; pending=0; fi
+    if [ "$ring" = 1 ]; then ring_ts=$now; ring_acc=$carry; fi
   fi
 
   # prompt_id changing means a new prompt started. Sampling no longer waits for
@@ -166,8 +207,9 @@ cmd_statusline() {
     [ -n "${transcript:-}" ] && ttl=$(detect_ttl "$transcript" || printf '%s' "${ttl:-0}")
   fi
 
-  printf '%s %s %s %s %s %s %s %s %s %s\n' "$cost" "$pending" "$ring_ts" "$shown" "$shown_ts" \
+  printf '%s %s %s %s %s %s %s %s %s %s %s\n' "$cost" "$pending" "$ring_ts" "$shown" "$shown_ts" \
     "$prev_prompt" "${turn_cost:-$cost}" "${turn_ctx:-$used}" "${last_call:-0}" "${ttl:-0}" \
+    "${ring_acc:-0}" \
     > "$state.tmp" 2>/dev/null && mv -f "$state.tmp" "$state" 2>/dev/null || true
 
   # Context, parked where the band hook can read it.
@@ -404,6 +446,28 @@ cmd_hook() {
 
 human() { awk -v n="$1" 'BEGIN { printf (n >= 1000000 ? "%.2fM" : "%.0fk"), n / (n >= 1000000 ? 1000000 : 1000) }'; }
 
+# ── halt marker ───────────────────────────────────────────────────────────────
+# Stop and Notification are the two moments a turn hands control back: work
+# submitted, a question asked, permission wanted.
+#
+# This drops a marker rather than ringing, and the difference matters. A hook
+# payload carries no cost — none of them do — so the money would have to come
+# from the state file, and at the instant Stop fires the statusline has not yet
+# been re-run with the final request's cost in it. On a one-request turn that
+# request is the entire spend, and the ring would announce nothing at all. So
+# leave a mark and let the statusline ring on its next render, with the real
+# number in hand. Idle sessions keep rendering on the refreshInterval timer —
+# checked across two dozen of them at once, every state file had been rewritten
+# within the last second while the cached lines beside them were minutes old —
+# so a marker is never left sitting for longer than that.
+cmd_halt() {
+  [ "$RING" = on_halt ] || exit 0
+  local session
+  session=$(jq -r '.session_id // empty' 2>/dev/null)
+  [ -n "$session" ] || exit 0
+  : > "$RUN/rtc-$session.halt" 2>/dev/null || true
+}
+
 # ── setup ─────────────────────────────────────────────────────────────────────
 cmd_setup() {
   command -v jq >/dev/null 2>&1 || die "realtokencost needs jq."
@@ -474,6 +538,27 @@ cmd_doctor() {
   if [ -s "$ROOT/share/cash-register.wav" ]; then printf '  sound       %s\n' "$ROOT/share/cash-register.wav"
   else printf '  sound       MISSING at %s\n' "$ROOT/share/cash-register.wav"; fi
 
+  if [ "${RTC_MUTE:-0}" = "1" ]; then
+    printf '  ring        muted by RTC_MUTE=1 — the number still floats\n'
+  else
+    case "$RING" in
+      immediate)
+        printf '  ring        immediate — every bump over $%s, at most one per %ss\n' "$MIN" "$COOLDOWN" ;;
+      cumulative_threshold)
+        printf '  ring        cumulative_threshold — once per $%s spent\n' "$THRESHOLD" ;;
+      on_halt)
+        printf '  ring        on_halt — when a turn hands back, if money moved since the last one\n'
+        if grep -q '"Stop"' "$ROOT/hooks/hooks.json" 2>/dev/null; then
+          printf '              marked by the Stop hook; if you upgraded mid-session, restart to load it\n'
+        else
+          printf '              but %s has no Stop hook, so nothing will mark a halt\n' "$ROOT/hooks/hooks.json"
+        fi ;;
+      *)
+        printf '  ring        RTC_RING=%s is not a mode — ringing immediately instead\n' "$RING"
+        printf '              modes: immediate, cumulative_threshold, on_halt\n' ;;
+    esac
+  fi
+
   wired=$(jq -r '.statusLine.command // "none"' "$SETTINGS" 2>/dev/null)
   if [ "$wired" = "$SELF" ]; then
     printf '  statusLine  wired (refreshInterval %s)\n' "$(jq -r '.statusLine.refreshInterval // "unset"' "$SETTINGS")"
@@ -530,10 +615,11 @@ cmd_doctor() {
 case "${1:-statusline}" in
   statusline) cmd_statusline ;;
   hook)       cmd_hook ;;
+  halt)       cmd_halt ;;
   setup)      cmd_setup ;;
   uninstall)  cmd_uninstall ;;
   doctor)     cmd_doctor ;;
   -h|--help|help)
-    sed -n '2,16p' "$SELF" | sed 's/^# \{0,1\}//' ;;
-  *) die "unknown command: $1 (try: statusline, hook, setup, uninstall, doctor)" ;;
+    sed -n '2,20p' "$SELF" | sed 's/^# \{0,1\}//' ;;
+  *) die "unknown command: $1 (try: statusline, hook, halt, setup, uninstall, doctor)" ;;
 esac
