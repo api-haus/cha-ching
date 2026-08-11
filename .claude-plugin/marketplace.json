@@ -1,7 +1,7 @@
 {
   "name": "realtokencost",
   "description": "What the context in front of you actually costs, before you press enter.",
-  "version": "2.1.0",
+  "version": "2.2.0",
   "owner": {
     "name": "api-haus"
   },

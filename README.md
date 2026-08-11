@@ -132,6 +132,9 @@ Checked against first principles on a live session: the learned figure said `$0.
 point — it stays correct across models, plans and rate changes because it measures instead of
 asserting.
 
+The figure is measured per request rather than per turn, so it appears within seconds of a session's
+first response instead of after two completed turns.
+
 What a bare submit costs per million tokens is a property of the model rather than of the session —
 it is essentially the cache-read rate — so it is learned once and kept in
 `~/.cache/realtokencost/rate-<model>`. A new session inherits it and shows a figure on its first

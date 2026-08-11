@@ -2,7 +2,7 @@
   "name": "realtokencost",
   "displayName": "realtokencost — what the context in front of you actually costs",
   "description": "Shows what submitting your current context costs before you send it, tracks whether the prompt cache is still alive (a lapsed one rewrites the whole window at twenty times the read rate), rings a cash register when money moves and warns as the window fills. Chains to ccstatusline or any other statusline instead of replacing it.",
-  "version": "2.1.0",
+  "version": "2.2.0",
   "author": {
     "name": "Kassinity"
   },

@@ -52,9 +52,33 @@ COOLDOWN=${RTC_COOLDOWN:-3}  # seconds between rings; spend in between accrues
 MIN=${RTC_MIN:-0.005}        # spend below this is not worth a sound
 BANDS=${RTC_BANDS:-10}       # announce context every N percent
 ESTIMATE=${RTC_ESTIMATE:-1}  # 0 hides the [~$0.42] next-message estimate
-SAMPLES=${RTC_SAMPLES:-6}    # completed turns kept to calibrate the estimate
+SAMPLES=${RTC_SAMPLES:-12}   # recent requests kept to calibrate the estimate
 
 die() { printf '%s\n' "$*" >&2; exit 1; }
+
+# One request, one measurement: this much money bought a re-read of this much
+# context. Requests whose last call wrote more than it read rebuilt the cache and
+# are filed apart — they measure an event, not a rate. Recording per request
+# rather than per turn is what lets a session show a figure within seconds of
+# its first response instead of after two whole turns.
+record_sample() {
+  local bump="$1" ctx="$2" cw="$3" cr="$4" sess="$5" ratefile="$6" bucket=turns sample f
+  [ "${ctx:-0}" -gt 1000 ] || return 0
+  [ "${cw:-0}" -gt "${cr:-0}" ] && bucket=rebuilds
+  sample=$(awk -v d="$bump" -v ctx="$ctx" 'BEGIN { printf "%.6f", d / (ctx / 1000000) }')
+  [ -n "$sample" ] || return 0
+
+  f="$RUN/rtc-$sess.$bucket"
+  printf '%s\n' "$sample" >> "$f" 2>/dev/null || return 0
+  tail -n "$SAMPLES" "$f" > "$f.tmp" 2>/dev/null && mv -f "$f.tmp" "$f" 2>/dev/null || true
+
+  # Only ordinary requests teach the model rate.
+  [ "$bucket" = turns ] || return 0
+  mkdir -p "$CACHE_DIR" 2>/dev/null &&
+    printf '%s\n' "$sample" >> "$ratefile" 2>/dev/null &&
+    tail -n 40 "$ratefile" > "$ratefile.tmp" 2>/dev/null &&
+    mv -f "$ratefile.tmp" "$ratefile" 2>/dev/null || true
+}
 now_s() { date +%s.%N 2>/dev/null || date +%s; }
 
 # ── statusline ────────────────────────────────────────────────────────────────
@@ -109,11 +133,16 @@ cmd_statusline() {
     # tool-heavy turn lands as a few weighty numbers instead of a stream of
     # small ones, and nothing is ever dropped.
     # A bump means a request completed, which is also the moment the cache was
-    # last touched — and therefore when its clock restarted.
-    awk -v c="$cost" -v l="$last" 'BEGIN { exit !(c - l > 0) }' && last_call=$now
+    # last touched — and therefore when its clock restarted. It is also a
+    # measurement: this much money bought a re-read of this much context.
+    local bump
+    bump=$(awk -v c="$cost" -v l="$last" 'BEGIN { d = c - l; printf "%.6f", (d > 0 ? d : 0) }')
+    if awk -v b="$bump" 'BEGIN { exit !(b > 0) }'; then
+      last_call=$now
+      record_sample "$bump" "$used" "$cwrite" "$cread" "${session:-nosession}" "$ratefile"
+    fi
 
-    pending=$(awk -v p="${pending:-0}" -v c="$cost" -v l="$last" \
-      'BEGIN { d = c - l; printf "%.6f", p + (d > 0 ? d : 0) }')
+    pending=$(awk -v p="${pending:-0}" -v b="$bump" 'BEGIN { printf "%.6f", p + b }')
 
     if awk -v p="$pending" -v m="$MIN" -v n="$now" -v r="${ring_ts:-0}" -v cd="$COOLDOWN" \
         'BEGIN { exit !(p >= m && n - r >= cd) }'; then
@@ -125,37 +154,10 @@ cmd_statusline() {
     fi
   fi
 
-  # A completed turn is the only honest unit to predict from. prompt_id changes
-  # when a new prompt starts, so its previous value bounds the turn that just
-  # ended: what it cost, and how much context it was re-reading while it ran.
-  # Store the ratio, not the cost — that is what carries to a bigger window.
+  # prompt_id changing means a new prompt started. Sampling no longer waits for
+  # that — it happens on every request — so this boundary now only paces the
+  # once-per-turn TTL read.
   if [ "$prompt" != "$prev_prompt" ]; then
-    if [ -n "${turn_cost:-}" ] && [ "${turn_ctx:-0}" -gt 1000 ]; then
-      # A turn whose last request wrote more than it read rebuilt the cache. That
-      # is an event, not a working pattern, so it is filed separately: it must
-      # never set the warm expectation, and it is the only honest measure of what
-      # a rebuild costs.
-      local bucket=turns
-      [ "${cwrite:-0}" -gt "${cread:-0}" ] && bucket=rebuilds
-      local sample
-      sample=$(awk -v c0="$turn_cost" -v c1="$cost" -v ctx="$turn_ctx" \
-        'BEGIN { d = c1 - c0; if (d > 0) printf "%.6f", d / (ctx / 1000000) }')
-      if [ -n "$sample" ]; then
-        printf '%s\n' "$sample" >> "$RUN/rtc-${session:-nosession}.$bucket" 2>/dev/null || true
-        # Only ordinary turns teach the model rate. A rebuild describes an event.
-        if [ "$bucket" = turns ]; then
-          mkdir -p "$CACHE_DIR" 2>/dev/null &&
-            printf '%s\n' "$sample" >> "$ratefile" 2>/dev/null &&
-            tail -n 20 "$ratefile" > "$ratefile.tmp" 2>/dev/null &&
-            mv -f "$ratefile.tmp" "$ratefile" 2>/dev/null || true
-        fi
-      fi
-      # Keep only recent turns: a session's shape changes as the work changes.
-      tail -n "$SAMPLES" "$RUN/rtc-${session:-nosession}.$bucket" \
-        > "$RUN/rtc-${session:-nosession}.$bucket.tmp" 2>/dev/null &&
-        mv -f "$RUN/rtc-${session:-nosession}.$bucket.tmp" \
-              "$RUN/rtc-${session:-nosession}.$bucket" 2>/dev/null || true
-    fi
     prev_prompt=$prompt
     turn_cost=$cost
     turn_ctx=$used
@@ -393,7 +395,10 @@ cmd_hook() {
   [ "$band" -gt "$last" ] || exit 0             # once per band, on the way up
   printf '%s' "$band" > "$state" 2>/dev/null || true
 
-  jq -n --arg m "context $(( band * BANDS ))% used — $(human "$used") of $(human "$size") tokens" \
+  # Report where the window actually is. The band is only what triggered this —
+  # saying "40%" while the window sits at 45% disagrees with the statusline for
+  # no reason, and the statusline is right.
+  jq -n --arg m "context $(awk -v u="$used" -v s="$size" 'BEGIN { printf "%d", u * 100 / s }')% used — $(human "$used") of $(human "$size") tokens" \
     '{systemMessage: $m}'
 }
 
