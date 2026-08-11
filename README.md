@@ -132,8 +132,14 @@ Checked against first principles on a live session: the learned figure said `$0.
 point — it stays correct across models, plans and rate changes because it measures instead of
 asserting.
 
-It appears after your first completed turn, dimmed, and reaches full colour at three.
-`rtc doctor` reports calibration per session, never totalled across them.
+What a bare submit costs per million tokens is a property of the model rather than of the session —
+it is essentially the cache-read rate — so it is learned once and kept in
+`~/.cache/realtokencost/rate-<model>`. A new session inherits it and shows a figure on its first
+render, then prefers its own turns as they accumulate. Only ordinary turns teach it; a rebuild
+describes an event and is excluded.
+
+The figure is dimmed until three turns have landed. `rtc doctor` reports calibration per session,
+never totalled across them, plus what each model has learned.
 
 **It cannot account for what you are typing.** The payload carries `prompt_id` but never the draft
 text. For the same reason the figure cannot appear only while you type: measured over a 68-second

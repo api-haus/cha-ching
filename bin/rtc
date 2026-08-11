@@ -30,6 +30,7 @@ ROOT=$(dirname "$HERE")
 RUN=${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/realtokencost"
 CONFIG="$CONFIG_DIR/config"
+CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/realtokencost"
 SETTINGS="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json"
 
 # Config is a file rather than shell exports because hooks and the statusline are
@@ -61,7 +62,7 @@ cmd_statusline() {
   local payload model effort used size cost session
   payload=$(cat)
 
-  IFS=$'\t' read -r model effort used size cost session prompt cwrite cread transcript < <(
+  IFS=$'\t' read -r model effort used size cost session prompt cwrite cread transcript modelid < <(
     printf '%s' "$payload" | jq -r '
       [ (.model.display_name // "?"),
         (.effort.level // "-"),
@@ -72,10 +73,17 @@ cmd_statusline() {
         (.prompt_id // "-"),
         (.context_window.current_usage.cache_creation_input_tokens // 0),
         (.context_window.current_usage.cache_read_input_tokens // 0),
-        (.transcript_path // "")
+        (.transcript_path // ""),
+        (.model.id // "unknown" | gsub("[^A-Za-z0-9._-]"; "_"))
       ] | @tsv' 2>/dev/null
   )
   [ -n "${model:-}" ] || exit 0
+
+  # What a bare submit costs per million tokens is a property of the model, not
+  # of the session — it is essentially the cache-read rate. Learning it once and
+  # keeping it means a new session shows a figure on its first turn instead of
+  # spending two turns rediscovering a constant.
+  local ratefile="$CACHE_DIR/rate-${modelid:-unknown}"
 
   local now state last pending ring_ts shown shown_ts prev_prompt turn_cost turn_ctx last_call ttl ring=0
   now=$(now_s)
@@ -84,6 +92,13 @@ cmd_statusline() {
   last=""; pending=0; ring_ts=0; shown=0; shown_ts=0; prev_prompt="-"; turn_cost=""; turn_ctx=0
   last_call=0; ttl=0
   [ -r "$state" ] && IFS=' ' read -r last pending ring_ts shown shown_ts prev_prompt turn_cost turn_ctx last_call ttl < "$state" 2>/dev/null
+
+  # A session knows nothing about its own context until its first response lands,
+  # so a turn that opened before that has 0 recorded against it and would be
+  # thrown away by the guard below — leaving a restarted session with no estimate
+  # for as long as it takes to complete two more turns. Adopt the first real
+  # figure that appears instead.
+  if [ "${turn_ctx:-0}" -le 0 ] && [ "${used:-0}" -gt 0 ]; then turn_ctx=$used; fi
 
   if [ -z "${last:-}" ]; then
     # First sight. Adopt the total silently — announcing a session's whole
@@ -122,9 +137,19 @@ cmd_statusline() {
       # a rebuild costs.
       local bucket=turns
       [ "${cwrite:-0}" -gt "${cread:-0}" ] && bucket=rebuilds
-      awk -v c0="$turn_cost" -v c1="$cost" -v ctx="$turn_ctx" \
-        'BEGIN { d = c1 - c0; if (d > 0) printf "%.6f\n", d / (ctx / 1000000) }' \
-        >> "$RUN/rtc-${session:-nosession}.$bucket" 2>/dev/null || true
+      local sample
+      sample=$(awk -v c0="$turn_cost" -v c1="$cost" -v ctx="$turn_ctx" \
+        'BEGIN { d = c1 - c0; if (d > 0) printf "%.6f", d / (ctx / 1000000) }')
+      if [ -n "$sample" ]; then
+        printf '%s\n' "$sample" >> "$RUN/rtc-${session:-nosession}.$bucket" 2>/dev/null || true
+        # Only ordinary turns teach the model rate. A rebuild describes an event.
+        if [ "$bucket" = turns ]; then
+          mkdir -p "$CACHE_DIR" 2>/dev/null &&
+            printf '%s\n' "$sample" >> "$ratefile" 2>/dev/null &&
+            tail -n 20 "$ratefile" > "$ratefile.tmp" 2>/dev/null &&
+            mv -f "$ratefile.tmp" "$ratefile" 2>/dev/null || true
+        fi
+      fi
       # Keep only recent turns: a session's shape changes as the work changes.
       tail -n "$SAMPLES" "$RUN/rtc-${session:-nosession}.$bucket" \
         > "$RUN/rtc-${session:-nosession}.$bucket.tmp" 2>/dev/null &&
@@ -177,7 +202,7 @@ cmd_statusline() {
 
     if [ -z "$segment" ]; then
       local est=""
-      [ "$ESTIMATE" != "0" ] && est=$(estimate "${session:-nosession}" "$used" "${last_call:-0}" "${ttl:-0}" "$now" 2>/dev/null)
+      [ "$ESTIMATE" != "0" ] && est=$(estimate "${session:-nosession}" "$used" "${last_call:-0}" "${ttl:-0}" "$now" "$ratefile" 2>/dev/null)
       segment=$(render "$model" "$effort" "$used" "$size" "$cost" "$shown" "$shown_ts" "$now" "${est:-}")
       [ "$fading" = 0 ] && {
         printf '%s\n%s\n' "$key" "$segment" > "$cache.tmp" 2>/dev/null &&
@@ -237,8 +262,11 @@ detect_ttl() {
 # few tokens of reply. Cold cost comes from an observed rebuild if this session
 # has suffered one, and otherwise from the write/read price ratio.
 estimate() {
-  local sess="$1" ctx="$2" last_call="$3" ttl="$4" now="$5"
+  local sess="$1" ctx="$2" last_call="$3" ttl="$4" now="$5" ratefile="$6"
   local turns="$RUN/rtc-$sess.turns" cold="$RUN/rtc-$sess.rebuilds"
+  # This session's own turns are the better evidence. Fall back to what this
+  # model has taught us before, so a fresh session is not blind.
+  [ -r "$turns" ] || turns="$ratefile"
   [ -r "$turns" ] || return 1
   [ "${ctx:-0}" -gt 0 ] || return 1
   awk -v ctx="$ctx" -v coldf="$cold" -v lc="$last_call" -v ttl="$ttl" -v now="$now" '
@@ -483,7 +511,14 @@ cmd_doctor() {
         printf '  estimate    %.8s — %s turn(s), calibrated\n' "$f" "$n"
       fi
     done
-    [ "$any" = 0 ] && printf '  estimate    no completed turns recorded yet in any session\n'
+    local rf
+    for rf in "$CACHE_DIR"/rate-*; do
+      [ -r "$rf" ] || continue
+      any=1
+      printf '  model rate  %s — %s sample(s), inherited by new sessions\n' \
+        "${rf##*/rate-}" "$(wc -l < "$rf")"
+    done
+    [ "$any" = 0 ] && printf '  estimate    no completed turns recorded yet — send a message and it calibrates\n'
   fi
 }
 
