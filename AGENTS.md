@@ -89,6 +89,14 @@ Across sessions, `$XDG_CACHE_HOME/realtokencost/rate-<model_id>` holds what a ba
 that model. It is a property of the model, not the session, so a new session inherits it and shows a
 figure immediately instead of relearning a constant. Only ordinary requests teach it.
 
+Also across sessions, under the default `RTC_RING_SCOPE=global`, the ear's state leaves the session
+file for `$RUN/rtc-global-<uid>.ring`: when the last ring was, and what has not been announced yet.
+The uid is in the name because `TMPDIR` stands in for `XDG_RUNTIME_DIR` where there is none and
+`/tmp` is shared — a file owned by another user fails every write silently, which reads from the
+inside exactly like a broken ring. In this scope `ring_acc` in the session file means something
+narrower: money this session accepted but has not handed over yet, non-zero only between losing the
+lock and winning it back.
+
 ## Things deliberately not done
 
 Do not "fix" these. Each was tried or considered and rejected for a reason.
@@ -155,6 +163,37 @@ The whole decision — what arrived, what each accumulator now holds, whether ei
 `awk`, deliberately. It replaced four, and the render path is paid once a second for every open
 session: measured 16ms before, 12.5ms after.
 
+`RTC_RING_SCOPE` decides whose money `ring_acc` is counting. Under `global`, the default, it is one
+file for the machine and ten sessions ring once between them; under `session` each keeps its own.
+`pending` is never shared in either — the floating number belongs to the statusline it renders on.
+
+Sharing it makes the accumulator a read-modify-write across processes, and the statusline is a
+separate process per session firing every second. Two of them reading the same `$4.95`, both adding
+their bump and both crossing `$5`, is two rings and one lost write. So there is a lock, and three
+things about it are load-bearing:
+
+**It is bash's noclobber redirect, not `flock` or `mkdir`.** `flock(1)` is not on macOS and `mkdir`
+costs a fork; `set -C` with `> file` opens `O_EXCL` from a builtin and writes the acquisition time in
+the same syscall. Verified under contention: 16 takers, 300 rounds, exactly one winner every round.
+Write the `2>/dev/null` **before** the target, not after — redirections are set up left to right, and
+one written last arrives too late to swallow the `cannot overwrite existing file` the failing one
+prints.
+
+**The lock is taken on a bump, never on an idle render.** A shared file read every second by every
+session and locked every second by every session would be exactly the cost this project spends its
+time avoiding. The gate is: money just arrived, or this session is still carrying money it failed to
+hand over, or a halt is waiting, or — in the modes where the clock alone can release a ring — the
+shared accumulator is non-empty and a cooldown may have expired. A `cumulative_threshold` holding
+`$2.30` for ten minutes never touches the lock. Measured: idle renders 15.2ms before the change,
+15.7ms after, which is noise; bump renders 21.9ms against 23.4ms.
+
+**A lost lock defers, it never drops.** The loser keeps the money in its own `ring_acc` and tries
+again on the next render — which is why "still carrying money" is one of the gate conditions, since
+by every other test that session is idle and would sit on it until it next spent. Ten sessions
+piling onto the lock at the same instant is the shape of the worst case, because they render on the
+same timer, so the spin is ten waits of 20ms: enough for all of them to drain in turn. Anything
+holding it for more than five seconds is presumed dead and has it taken back.
+
 `share/cash-register.wav` carries **400ms of silence in front**, and that is not padding to be
 trimmed. Audio sinks suspend when idle and waking one swallows the start of a short sample — badly
 over Bluetooth, where resuming the A2DP link costs hundreds of milliseconds. The register's opening
@@ -177,9 +216,18 @@ Feed successive renders with rising `cost` to exercise the ring, the fade and sa
 `session_id` and delete `$XDG_RUNTIME_DIR/rtc-<id>.*` between runs, or you will debug yesterday's
 state. `XDG_CACHE_HOME` to a temp dir keeps a test from teaching the real model rate.
 
-Time-dependent behaviour — fade, cooldown, cache expiry — is tested by rewriting the timestamp in the
-state file rather than sleeping. Rewrite it with `printf "%.6f"`; `awk`'s default output format turns
-an epoch into `1.78648e+09` and the test silently stops meaning anything.
+Time-dependent behaviour — fade, cache expiry — is tested by rewriting the timestamp in the state
+file rather than sleeping. Rewrite it with `printf "%.6f"`; `awk`'s default output format turns an
+epoch into `1.78648e+09` and the test silently stops meaning anything.
+
+Cross-session behaviour cannot be tested that way, because the point of it is what several processes
+do to one file at the same moment. Drive a dozen `session_id`s at once with `&` and `wait`, and count
+rings by putting a fake `pw-play` first on `PATH` that appends a timestamp to a file — that exercises
+the real `play_sound`. The two assertions worth writing: `$50` spent across ten concurrent sessions
+at `RTC_THRESHOLD=5` gives exactly ten rings with nothing left carried, and no two ring timestamps
+under `immediate` are closer together than `RTC_COOLDOWN`. Both failed on the first implementation.
+Give the sessions an idle render or two at the end before counting, since a ring that landed on the
+same instant as the last bump is delivered on the render after it.
 
 ## Releasing
 

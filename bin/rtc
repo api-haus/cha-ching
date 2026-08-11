@@ -69,6 +69,15 @@ SAMPLES=${RTC_SAMPLES:-12}   # recent requests kept to calibrate the estimate
 RING=${RTC_RING:-immediate}
 THRESHOLD=${RTC_THRESHOLD:-5}
 
+# Whose money the ring is counting. Ten sessions open at once are one person
+# spending, one pair of ears and one budget, so the ear's state is shared by
+# default: one ring per THRESHOLD dollars across the machine, one ring per
+# COOLDOWN seconds across the machine. `session` gives each session its own
+# accumulator and its own clock, which is what this did before the switch
+# existed. The eye stays per session either way — the floating number belongs to
+# the statusline it appears on.
+SCOPE=${RTC_RING_SCOPE:-global}
+
 die() { printf '%s\n' "$*" >&2; exit 1; }
 
 # One request, one measurement: this much money bought a re-read of this much
@@ -95,6 +104,61 @@ record_sample() {
     mv -f "$ratefile.tmp" "$ratefile" 2>/dev/null || true
 }
 now_s() { date +%s.%N 2>/dev/null || date +%s; }
+
+# The shared ring state, in two numbers: when it last spoke, and what it has not
+# announced yet. Read on every render under a global scope, so it is builtins
+# only — no process starts to find out that nothing is due.
+read_ring() {
+  gts=0; gacc=0
+  [ -r "$1" ] && IFS=' ' read -r gts gacc < "$1" 2>/dev/null
+  case "${gts:-}" in ''|*[!0-9.]*) gts=0 ;; esac
+  case "${gacc:-}" in ''|*[!0-9.]*) gacc=0 ;; esac
+}
+
+# Writing that state is a read-modify-write, and the statusline runs in a
+# separate process for every open session, every second. Without a mutex two of
+# them read the same $4.95, both add their bump, both cross $5 — two rings, and
+# one of the two writes gone.
+#
+# flock is not on macOS and mkdir costs a fork, so this is bash's noclobber
+# redirect: O_EXCL, from a builtin, no process at all, and it writes the
+# acquisition time in the same syscall it takes the lock with. Verified under
+# contention — 16 takers, 300 rounds, exactly one winner every round.
+#
+# stderr is redirected before the target rather than after it. Redirections are
+# set up left to right, so a 2>/dev/null written last arrives too late to
+# swallow the "cannot overwrite existing file" that the failing one prints.
+#
+# What the lock guards is a read and a write, so a session that loses waits and
+# takes it — ten of them draining in turn cost a tenth of a render each. Giving
+# up after a bounded spin rather than blocking is what keeps a wedged holder
+# from taking the statusline down with it; the money a giver-up is carrying is
+# safe where it is, and comes back on the next render.
+ring_lock() {
+  local f="$1" now="$2" held="" try=0
+  # Ten waits of 20ms. The section is a read, an awk and a write — a few
+  # milliseconds — so this covers every open session piling onto it at the same
+  # instant, which is the shape of the worst case: they render on the same timer.
+  while [ "$try" -lt 10 ]; do
+    try=$((try + 1))
+    set -C
+    if printf '%s\n' "$now" 2>/dev/null > "$f"; then set +C; return 0; fi
+    set +C
+
+    # A process killed between taking this and releasing it would silence every
+    # session on the machine for as long as the file survived, so a lock nobody
+    # has released in five seconds is taken from it.
+    held=0
+    [ -r "$f" ] && read -r held < "$f" 2>/dev/null
+    case "${held:-}" in ''|*[!0-9.]*) held=0 ;; esac
+    if [ $(( ${now%.*} - ${held%.*} )) -gt 5 ]; then
+      rm -f "$f" 2>/dev/null || true
+      continue
+    fi
+    sleep 0.02 2>/dev/null || true
+  done
+  return 1
+}
 
 # ── statusline ────────────────────────────────────────────────────────────────
 cmd_statusline() {
@@ -125,7 +189,8 @@ cmd_statusline() {
   local ratefile="$CACHE_DIR/rate-${modelid:-unknown}"
 
   local now state last pending ring_ts shown shown_ts prev_prompt turn_cost turn_ctx last_call ttl
-  local ring_acc halt halted=0 pulse=0 ring=0 bump money carry=0
+  local ring_acc halt="" halted=0 pulse=0 ring=0 bump money carry=0 deferred=0
+  local gring="" gts=0 gacc=0 locked=0 rts
   now=$(now_s)
   state="$RUN/rtc-${session:-nosession}.state"
 
@@ -138,10 +203,14 @@ cmd_statusline() {
 
   # The turn handed back while we were not looking. Consumed on sight whether or
   # not it becomes a ring — it happened once, and if no money moved with it there
-  # is nothing to announce.
+  # is nothing to announce. Under a shared ring it is consumed only once this
+  # session holds the lock, or a halt would be swallowed by a lock it lost.
   if [ "$RING" = on_halt ]; then
     halt="$RUN/rtc-${session:-nosession}.halt"
-    [ -e "$halt" ] && { halted=1; rm -f "$halt" 2>/dev/null || true; }
+    if [ -e "$halt" ]; then
+      halted=1
+      [ "$SCOPE" = session ] && { rm -f "$halt" 2>/dev/null || true; }
+    fi
   fi
 
   # A session knows nothing about its own context until its first response lands,
@@ -167,24 +236,63 @@ cmd_statusline() {
     #
     # One awk decides all of it. This runs every second for every open session,
     # and each of these used to be a process of its own.
+    rts=${ring_ts:-0}
+
+    # Under a shared ring the ear's two numbers come from one file for the whole
+    # machine instead of from this session's state, and the session's own
+    # ring_acc changes meaning: it becomes money this session has accepted but
+    # not yet handed over, which is only ever non-zero after a lost lock.
+    if [ "$SCOPE" != session ]; then
+      gring="$RUN/rtc-global-${UID:-0}.ring"
+      read_ring "$gring"
+      rts=$gts
+
+      # Take the lock only when something can come of it: money has just
+      # arrived, this session is still carrying money it failed to hand over, a
+      # halt is waiting to be spent, or — in the modes where the clock alone can
+      # release a ring — money is already sitting there with a cooldown that may
+      # have expired since. A threshold holding $2.30 for ten minutes never
+      # touches it. This is the render path, once a second for every open
+      # session, and it is the reason the lock is affordable at all.
+      #
+      # The carried-money case is what keeps a lost race from becoming a lost
+      # ring: a session that gave up is otherwise idle by every other test here,
+      # and would sit on the money until it next spent some.
+      local need=0
+      [ "$cost" != "$last" ] && need=1
+      [ "$halted" = 1 ] && need=1
+      case "${ring_acc//[0.]/}" in ?*) need=1 ;; esac
+      case "$RING" in
+        cumulative_threshold|on_halt) ;;
+        *) case "${gacc//[0.]/}" in ?*) need=1 ;; esac ;;
+      esac
+
+      if [ "$need" = 1 ] && ring_lock "$gring.lock" "$now"; then
+        locked=1
+        read_ring "$gring"     # the read above was a guess; this one is the truth
+        rts=$gts
+      fi
+    fi
+
     money=$(awk -v c="$cost" -v l="$last" -v p="${pending:-0}" -v a="${ring_acc:-0}" \
-                -v min="$MIN" -v cd="$COOLDOWN" -v thr="$THRESHOLD" -v mode="$RING" \
-                -v halted="$halted" -v now="$now" -v sts="${shown_ts:-0}" -v rts="${ring_ts:-0}" '
+                -v ga="$gacc" -v min="$MIN" -v cd="$COOLDOWN" -v thr="$THRESHOLD" -v mode="$RING" \
+                -v halted="$halted" -v now="$now" -v sts="${shown_ts:-0}" -v rts="$rts" '
       BEGIN {
         d = c - l; if (d < 0) d = 0
         p += d; a += d
+        acc = a + ga             # everything the ear has not announced, wherever it was held
         carry = 0
         pulse = (p >= min && now - sts >= cd)
         # What survives a ring. A threshold keeps its remainder: the crossing
         # rarely lands on the number exactly, and zeroing what is left over
         # would drop a fraction of a ring every time and drift quieter than the
         # threshold asked for. The other two modes have announced everything.
-        if      (mode == "cumulative_threshold") { ring = (a >= thr); if (ring) carry = a % thr }
-        else if (mode == "on_halt")                ring = (halted && a >= min)
-        else                                       ring = (a >= min && now - rts >= cd)
-        printf "%.6f %.6f %.6f %d %d %.6f", d, p, a, pulse, ring, carry
+        if      (mode == "cumulative_threshold") { ring = (acc >= thr); if (ring) carry = acc % thr }
+        else if (mode == "on_halt")                ring = (halted && acc >= min)
+        else                                       ring = (acc >= min && now - rts >= cd)
+        printf "%.6f %.6f %.6f %d %d %.6f %.6f", d, p, acc, pulse, ring, carry, a
       }')
-    IFS=' ' read -r bump pending ring_acc pulse ring carry <<< "$money"
+    IFS=' ' read -r bump pending ring_acc pulse ring carry deferred <<< "$money"
 
     if [ "$bump" != "0.000000" ]; then
       last_call=$now
@@ -192,7 +300,25 @@ cmd_statusline() {
     fi
 
     if [ "$pulse" = 1 ]; then shown=$pending; shown_ts=$now; pending=0; fi
-    if [ "$ring" = 1 ]; then ring_ts=$now; ring_acc=$carry; fi
+
+    if [ -z "$gring" ]; then
+      if [ "$ring" = 1 ]; then ring_ts=$now; ring_acc=$carry; fi
+    elif [ "$locked" = 1 ]; then
+      # Everything this session was carrying has now been handed over, so its
+      # own accumulator goes back to empty.
+      if [ "$ring" = 1 ]; then gts=$now; gacc=$carry; else gacc=$ring_acc; fi
+      ring_acc=0
+      printf '%s %s\n' "$gts" "$gacc" > "$gring.tmp" 2>/dev/null &&
+        mv -f "$gring.tmp" "$gring" 2>/dev/null || true
+      rm -f "$gring.lock" 2>/dev/null || true
+      [ "$halted" = 1 ] && { rm -f "$halt" 2>/dev/null || true; }
+    else
+      # Another session holds it. Keep this session's own money where it is and
+      # come back on the next render — a ring deferred by a second is still the
+      # ring, money dropped on the floor is a bug.
+      ring=0
+      ring_acc=$deferred
+    fi
   fi
 
   # prompt_id changing means a new prompt started. Sampling no longer waits for
@@ -557,6 +683,32 @@ cmd_doctor() {
         printf '  ring        RTC_RING=%s is not a mode — ringing immediately instead\n' "$RING"
         printf '              modes: immediate, cumulative_threshold, on_halt\n' ;;
     esac
+
+    # A shared ring is a session going quiet because another one spoke for it,
+    # which looks exactly like a broken ring from inside any one session.
+    if [ "$SCOPE" = session ]; then
+      printf '  ring scope  session — each session counts and announces its own spend\n'
+    else
+      local gring gts gacc lock_ts
+      gring="$RUN/rtc-global-${UID:-0}.ring"
+      read_ring "$gring"
+      if [ "$SCOPE" = global ]; then
+        printf '  ring scope  global — one ring for every session on this machine\n'
+      else
+        printf '  ring scope  RTC_RING_SCOPE=%s is not a scope — sharing globally instead\n' "$SCOPE"
+        printf '              scopes: session, global\n'
+      fi
+      printf '              %s\n' "$gring"
+      awk -v a="$gacc" -v t="$gts" -v n="$(now_s)" 'BEGIN {
+        printf "              $%.2f carried, last ring ", a
+        if (t > 0) printf "%ds ago\n", n - t; else printf "none yet\n" }'
+      if [ -e "$gring.lock" ]; then
+        lock_ts=0; read -r lock_ts < "$gring.lock" 2>/dev/null
+        printf '              lock held %ss — over 5s means a session died holding it, and the\n' \
+          "$(awk -v t="${lock_ts:-0}" -v n="$(now_s)" 'BEGIN { printf "%d", n - t }')"
+        printf '              next session to want it takes it back\n'
+      fi
+    fi
   fi
 
   wired=$(jq -r '.statusLine.command // "none"' "$SETTINGS" 2>/dev/null)

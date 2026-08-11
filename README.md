@@ -99,6 +99,7 @@ shell.
 | `RTC_CHAIN` | — | your statusline command; gets the same payload, output appended |
 | `RTC_SEGMENT` | `1` | `0` renders nothing of ours — harvest and chain only |
 | `RTC_RING` | `immediate` | what releases the sound — see below |
+| `RTC_RING_SCOPE` | `global` | `session` counts and announces each session's spend on its own |
 | `RTC_THRESHOLD` | `5` | dollars per ring under `cumulative_threshold` |
 | `RTC_COOLDOWN` | `3` | seconds between rings; spend in between accrues into the next one |
 | `RTC_FADE` | `4` | seconds for the floating number to fade out |
@@ -136,6 +137,23 @@ however the bumps happened to fall.
 
 The floating number keeps its own rhythm in all three. It is free — it costs a glance you are already
 giving the statusline — while a sound interrupts, so only the sound is worth moving.
+
+## One ring for the machine
+
+Ten sessions open at once are still one person spending, one pair of ears and one budget. So the
+accumulator and the cooldown are shared: one ring per `$5` across every session on the machine, one
+ring per `RTC_COOLDOWN` seconds across every session, rung by whichever session happens to be the one
+that crosses the line. `RTC_RING_SCOPE=session` gives each session its own accumulator and its own
+clock, which is what this did before the switch existed.
+
+The floating number is never shared. It costs a glance rather than an interruption, and it belongs to
+the statusline it appears on — nobody wants their spend announced on somebody else's line.
+
+The shared state is two numbers in a file, and every session takes a lock before touching it: bash's
+`O_EXCL` redirect, held for one read and one write. A session that cannot get the lock keeps its
+money and comes back on the next render a second later, so a ring is delayed rather than dropped. A
+session killed while holding it has the lock taken back after five seconds. `rtc doctor` prints what
+is carried, how long ago the last ring was, and whether anything holds the lock right now.
 
 ## What it costs to submit
 
