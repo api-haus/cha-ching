@@ -493,6 +493,15 @@ and bash 3.2.57 in a container — see the macOS constraint above for why both s
 worth the trouble. `drive/bench.sh` times idle renders, which is the number the performance section
 below is about.
 
+`drive/mutate.sh` drives the drives: it breaks one load-bearing line of `bin/rtc` at a time and
+checks that some assertion goes red. Run it after adding a rule, and add a mutant for the rule while
+you are there — a passing drive is not evidence until you have watched it fail, and the first
+version of this suite shipped an assertion that compared two literals and passed against every
+broken script it was ever run on. It also measures what the suite is weak at. Deleting the ring lock
+outright is caught on about the third run of the ten-way drive and not the first, because what that
+deletes is a certainty and what it leaves is a race; that mutant asks for eight runs and reports
+which one caught it, rather than being quietly dropped for being awkward.
+
 Two things the drives cannot reach, so they were driven by hand and are worth repeating by hand
 after any change to the wire tailer. Watching a live Kimi session: `kimi -p '…'` in a scratch
 directory with a one-second render loop pointed at the session it creates (`-p` refuses to combine
