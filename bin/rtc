@@ -12,11 +12,19 @@
 # harvests both, and hands the payload straight on to whatever statusline you
 # already run.
 #
-#   rtc statusline   harvest, render, chain   (what statusLine.command runs)
+# Kimi Code has the same asymmetry with different names: [status_line].command
+# in tui.toml gets a JSON snapshot (context but no cost — Kimi is
+# subscription-based), and the per-request token usage lives in the session's
+# wire.jsonl. So under Kimi the dollars are computed, not harvested: measured
+# tokens times rates from `rtc rates` (models.dev) or an RTC_PRICE_* override.
+# Nothing about prices is compiled in.
+#
+#   rtc statusline   harvest, render, chain   (what the status line command runs)
 #   rtc hook         context band warnings    (wired by the plugin)
 #   rtc halt         mark a turn handing back (wired by the plugin)
-#   rtc setup        claim the statusLine slot, keeping what was there
+#   rtc setup        claim the status line slot, keeping what was there
 #   rtc uninstall    give it back
+#   rtc rates        fetch model prices from models.dev (Kimi money source)
 #   rtc doctor       explain why it is quiet
 set -u
 
@@ -33,6 +41,9 @@ CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/realtokencost"
 CONFIG="$CONFIG_DIR/config"
 CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/realtokencost"
 SETTINGS="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json"
+KIMI_HOME="${KIMI_CODE_HOME:-$HOME/.kimi-code}"
+KIMI_TUI="$KIMI_HOME/tui.toml"
+KIMI_CONF="$KIMI_HOME/config.toml"
 
 # Config is a file rather than shell exports because hooks and the statusline are
 # launched by Claude Code, which need not have inherited your shell's env. A real
@@ -92,7 +103,7 @@ record_sample() {
   sample=$(awk -v d="$bump" -v ctx="$ctx" 'BEGIN { printf "%.6f", d / (ctx / 1000000) }')
   [ -n "$sample" ] || return 0
 
-  f="$RUN/rtc-$sess.$bucket"
+  f="$RUN/$sess.$bucket"
   printf '%s\n' "$sample" >> "$f" 2>/dev/null || return 0
   tail -n "$SAMPLES" "$f" > "$f.tmp" 2>/dev/null && mv -f "$f.tmp" "$f" 2>/dev/null || true
 
@@ -160,27 +171,238 @@ ring_lock() {
   return 1
 }
 
+# ── kimi measurement ──────────────────────────────────────────────────────────
+# Kimi Code is subscription-based and reports no cost anywhere, so under Kimi
+# the dollars are computed, not harvested: the session's wire.jsonl carries one
+# usage.record row per request with a full token breakdown, and those measured
+# tokens are priced. Rates come from the config or from `rtc rates` — nothing
+# about prices is compiled into this script.
+
+# The four rates a Kimi request is priced with — input cache_read cache_write
+# output, dollars per million tokens. An RTC_PRICE_<model> line in the config
+# always wins; the models.dev cache written by `rtc rates` is the fallback.
+# No rate, no money: the caller goes quiet about it rather than show a number
+# it cannot stand behind.
+# The four rates a Kimi request is priced with — input cache_read cache_write
+# output, dollars per million tokens. Precedence: an RTC_PRICE_<model> config
+# line always wins; then the models.dev cache written by `rtc rates`; then the
+# bundled seed in share/prices.tsv, which exists so a fresh install shows money
+# before any fetch has run — dated, marked, and never covering a model nobody
+# sells by the token. No rate anywhere, no money: the caller goes quiet about
+# it rather than show a number it cannot stand behind.
+#
+# Returns via globals, not stdout, so the source tier survives the call:
+# PRICE holds the four rates, PRICE_SRC names the tier (override/cache/seed).
+price_for() {
+  PRICE=""; PRICE_SRC=""
+  local key="RTC_PRICE_$(printf '%s' "$1" | tr -c 'A-Za-z0-9_' '_')" v=""
+  v=${!key:-}
+  if [ -n "$v" ]; then PRICE_SRC=override
+  elif [ -r "$CACHE_DIR/price-$1" ]; then
+    local a b c d
+    IFS=' ' read -r a b c d _ < "$CACHE_DIR/price-$1" 2>/dev/null
+    v="$a $b $c $d"
+    PRICE_SRC=cache
+  else
+    # The seed is keyed by wire alias; read with builtins only, and only ever
+    # reached when nothing fresher exists, so it costs no fork in steady state.
+    local sa si scr scw so
+    while IFS=$'\t' read -r sa si scr scw so _; do
+      case "$sa" in ''|\#*) continue ;; esac
+      if [ "${sa//[^A-Za-z0-9._-]/_}" = "$1" ]; then
+        v="$si $scr $scw $so"
+        PRICE_SRC=seed
+        break
+      fi
+    done < "$ROOT/share/prices.tsv" 2>/dev/null
+  fi
+  [ "$(printf '%s' "$v" | wc -w)" = 4 ] || return 1
+  case "$v" in ''|*[!0-9.\ ]*) return 1 ;; esac
+  PRICE=$v
+}
+
+# The fetched cache rots like any table would, so it freshens itself: a model
+# running on the bundled seed, or a price file older than
+# RTC_RATES_MAX_AGE_DAYS, triggers one detached `rtc rates`, throttled by a
+# marker so a fleet of concurrent renders spawns at most one fetch per
+# interval. Renders only ever read the cache — the fetch replaces it
+# atomically when it lands, and a failed fetch leaves the last good numbers.
+rates_maybe_refresh() {
+  [ "${RTC_RATES_REFRESH:-1}" = "0" ] && return 0   # 0 disables; on by default
+  case "$PRICE_SRC" in override) return 0 ;; esac    # the user owns that number
+  local need=0 m
+  if [ "$PRICE_SRC" = cache ]; then
+    m=$(stat -c %Y "$CACHE_DIR/price-$1" 2>/dev/null || stat -f %m "$CACHE_DIR/price-$1" 2>/dev/null || printf '0')
+    case "$m" in ''|*[!0-9]*) m=0 ;; esac
+    [ $(( ${now%.*} - m )) -gt $(( ${RTC_RATES_MAX_AGE_DAYS:-30} * 86400 )) ] && need=1
+  else
+    need=1    # seed or nothing: there is something fresher to fetch
+  fi
+  [ "$need" = 1 ] || return 0
+  m=$(stat -c %Y "$CACHE_DIR/.rates-when" 2>/dev/null || stat -f %m "$CACHE_DIR/.rates-when" 2>/dev/null || printf '0')
+  case "$m" in ''|*[!0-9]*) m=0 ;; esac
+  # Six hours between attempts, however many renders ask — an offline machine
+  # should not earn a curl every second.
+  [ $(( ${now%.*} - m )) -lt 21600 ] && return 0
+  mkdir -p "$CACHE_DIR" 2>/dev/null && : > "$CACHE_DIR/.rates-when" 2>/dev/null || return 0
+  (setsid "$SELF" rates >/dev/null 2>&1 &) 2>/dev/null
+}
+
+# Reads the complete lines past the wire offset and folds the usage.record rows
+# into sums. A partial last line — a request being written at this moment — is
+# left for the next render: the offset only ever moves past a newline.
+# Prints: new_offset inputOther cacheRead cacheCreate output alias
+kimi_tail() {
+  local wire="$1" off="$2" chunk complete
+  chunk=$(tail -c +"$((off + 1))" -- "$wire" 2>/dev/null; printf x)
+  chunk=${chunk%x}
+  case "$chunk" in
+    "")      complete="" ;;
+    *$'\n')  complete=$chunk ;;
+    *$'\n'*) complete=${chunk%$'\n'*}$'\n' ;;
+    *)       complete="" ;;
+  esac
+  [ -n "$complete" ] || { printf '%s 0 0 0 0 \n' "$off"; return; }
+  printf '%s' "$complete" | jq -Rr '
+      fromjson? // empty | select(.type == "usage.record") |
+      [ (.usage.inputOther // 0), (.usage.inputCacheRead // 0),
+        (.usage.inputCacheCreation // 0), (.usage.output // 0),
+        (.model // "") ] | @tsv' 2>/dev/null |
+    awk -v off="$off" -v n="${#complete}" '
+      { io+=$1; cr+=$2; cw+=$3; o+=$4; if ($5 != "") a=$5 }
+      END { printf "%d %d %d %d %d %s", off + n, io, cr, cw, o, a }'
+}
+
+# Cost under Kimi is a running total this script maintains: tail the wire from
+# the offset in the state file, price the new rows, add them in. What the
+# session spent before rtc first saw its wire is adopted, never announced —
+# the same rule as a first cost sighting under Claude.
+#
+# Runs inside cmd_statusline and edits its variables directly: cost, cwrite,
+# cread, used, modelid, woffset, noprice.
+kimi_measure() {
+  local wiref="$RUN/$tag-$session.wire" wire="" walias="" wsize price=""
+  if [ -r "$wiref" ]; then { read -r wire; read -r walias; } < "$wiref" 2>/dev/null; fi
+  [ -n "$wire" ] && [ ! -f "$wire" ] && wire=""
+  if [ -z "$wire" ]; then
+    local d
+    for d in "$KIMI_HOME/sessions/"*/"$session" "$KIMI_HOME/sessions/"*/"session_$session"; do
+      if [ -f "$d/agents/main/wire.jsonl" ]; then wire="$d/agents/main/wire.jsonl"; break; fi
+    done
+    if [ -n "$wire" ]; then
+      printf '%s\n%s\n' "$wire" "$walias" > "$wiref.tmp" 2>/dev/null &&
+        mv -f "$wiref.tmp" "$wiref" 2>/dev/null || true
+      woffset=-1
+    fi
+  fi
+  [ -n "$wire" ] || { noprice=1; return; }
+
+  # Kimi sends no running total, so rtc maintains it: every render starts from
+  # what the state file carried, and new wire rows add to it below.
+  cost=${last:-0}
+
+  # The alias the wire reports ("kimi-code/k3") keys the learned rate and the
+  # price, not the display name the snapshot sends.
+  [ -n "$walias" ] && modelid=$(printf '%s' "$walias" | tr -c 'A-Za-z0-9._-' '_')
+  price_for "${modelid:-unknown}" || noprice=1
+  price=$PRICE
+  rates_maybe_refresh "${modelid:-unknown}"
+
+  wsize=$(stat -c %s "$wire" 2>/dev/null || stat -f %z "$wire" 2>/dev/null || printf '0')
+  case "${wsize:-}" in ''|*[!0-9]*) noprice=1; return ;; esac
+
+  if [ "$woffset" -lt 0 ] || [ "$wsize" -lt "$woffset" ]; then
+    woffset=$wsize    # first sight, or a rotated wire: adopt, never recount
+    return
+  fi
+  [ "$wsize" -gt "$woffset" ] || return 0
+
+  local t nio=0 ncr=0 ncw=0 no=0 nal=""
+  t=$(kimi_tail "$wire" "$woffset")
+  IFS=' ' read -r woffset nio ncr ncw no nal <<< "$t"
+  case "${woffset:-}" in ''|*[!0-9]*) noprice=1; return ;; esac
+  if [ -n "$nal" ] && [ "$nal" != "$walias" ]; then
+    walias=$nal
+    modelid=$(printf '%s' "$walias" | tr -c 'A-Za-z0-9._-' '_')
+    printf '%s\n%s\n' "$wire" "$walias" > "$wiref.tmp" 2>/dev/null &&
+      mv -f "$wiref.tmp" "$wiref" 2>/dev/null || true
+    if price_for "$modelid"; then noprice=0; price=$PRICE; fi
+  fi
+  [ $((nio + ncr + ncw + no)) -gt 0 ] || return 0
+  [ "$noprice" = 0 ] || return 0
+
+  # Priced like an API bill: plain input at the input rate, the cache halves at
+  # theirs. A rate change rescales the measurement; it never rewrites it.
+  cost=$(awk -v base="${last:-0}" -v io="$nio" -v cr="$ncr" -v cw="$ncw" -v o="$no" -v p="$price" \
+    'BEGIN { split(p, r, " "); printf "%.6f", base + (io*r[1] + cr*r[2] + cw*r[3] + o*r[4]) / 1000000 }')
+  cwrite=$ncw; cread=$ncr
+  [ "${used:-0}" -gt 0 ] || used=$((nio + ncr + ncw))
+}
+
 # ── statusline ────────────────────────────────────────────────────────────────
 cmd_statusline() {
-  local payload model effort used size cost session
+  local payload platform model effort used size cost session
   payload=$(cat)
 
-  IFS=$'\t' read -r model effort used size cost session prompt cwrite cread transcript modelid < <(
+  # Two payload shapes share this entry point. Claude Code sends snake_case
+  # with cost and context_window; Kimi Code sends a camelCase snapshot with
+  # context but never cost (it is subscription-based), which is why cost is 0
+  # here and computed from the wire log further down instead.
+  IFS=$'\t' read -r platform model effort used size cost session prompt cwrite cread transcript modelid < <(
     printf '%s' "$payload" | jq -r '
-      [ (.model.display_name // "?"),
-        (.effort.level // "-"),
-        (.context_window.total_input_tokens // 0),
-        (.context_window.context_window_size // 0),
-        (.cost.total_cost_usd // 0),
-        (.session_id // ""),
-        (.prompt_id // "-"),
-        (.context_window.current_usage.cache_creation_input_tokens // 0),
-        (.context_window.current_usage.cache_read_input_tokens // 0),
-        (.transcript_path // ""),
-        (.model.id // "unknown" | gsub("[^A-Za-z0-9._-]"; "_"))
-      ] | @tsv' 2>/dev/null
+      if .sessionId != null then
+        [ "kimi",
+          (if (.model // "") == "" then "?" else .model end),
+          "-",
+          (.contextTokens // 0),
+          (.maxContextTokens // 0),
+          0,
+          (.sessionId // ""),
+          "-",
+          0, 0, "",
+          "unknown"
+        ] | @tsv
+      else
+        [ "claude",
+          (.model.display_name // "?"),
+          (.effort.level // "-"),
+          (.context_window.total_input_tokens // 0),
+          (.context_window.context_window_size // 0),
+          (.cost.total_cost_usd // 0),
+          (.session_id // ""),
+          (.prompt_id // "-"),
+          (.context_window.current_usage.cache_creation_input_tokens // 0),
+          (.context_window.current_usage.cache_read_input_tokens // 0),
+          (.transcript_path // ""),
+          (.model.id // "unknown" | gsub("[^A-Za-z0-9._-]"; "_"))
+        ] | @tsv
+      end' 2>/dev/null
   )
   [ -n "${model:-}" ] || exit 0
+
+  local now state tag last pending ring_ts shown shown_ts prev_prompt turn_cost turn_ctx last_call ttl
+  local ring_acc woffset halt="" halted=0 pulse=0 ring=0 bump money carry=0 deferred=0
+  local gring="" gts=0 gacc=0 locked=0 rts noprice=0
+  now=$(now_s)
+  tag=rtc
+  [ "$platform" = kimi ] && tag=rtc-kimi
+  state="$RUN/$tag-${session:-nosession}.state"
+
+  last=""; pending=0; ring_ts=0; shown=0; shown_ts=0; prev_prompt="-"; turn_cost=""; turn_ctx=0
+  last_call=0; ttl=0; ring_acc=0; woffset=0
+  [ -r "$state" ] && IFS=' ' read -r last pending ring_ts shown shown_ts prev_prompt turn_cost turn_ctx last_call ttl ring_acc woffset < "$state" 2>/dev/null
+  # A state file written before the ring had modes stops at ttl, and read leaves
+  # the field it never wrote empty rather than absent. Same for woffset, which
+  # only Kimi sessions use.
+  [ -n "${ring_acc:-}" ] || ring_acc=0
+  # -1 is the unset sentinel: 0 is a valid wire offset (an empty wire adopts at
+  # size 0, and the first row appended must still count), so "never seen" has
+  # to be its own value.
+  case "${woffset:-}" in ''|*[!0-9-]*) woffset=-1 ;; esac
+
+  if [ "$platform" = kimi ] && [ -n "${session:-}" ]; then
+    kimi_measure
+  fi
 
   # What a bare submit costs per million tokens is a property of the model, not
   # of the session — it is essentially the cache-read rate. Learning it once and
@@ -188,25 +410,12 @@ cmd_statusline() {
   # spending two turns rediscovering a constant.
   local ratefile="$CACHE_DIR/rate-${modelid:-unknown}"
 
-  local now state last pending ring_ts shown shown_ts prev_prompt turn_cost turn_ctx last_call ttl
-  local ring_acc halt="" halted=0 pulse=0 ring=0 bump money carry=0 deferred=0
-  local gring="" gts=0 gacc=0 locked=0 rts
-  now=$(now_s)
-  state="$RUN/rtc-${session:-nosession}.state"
-
-  last=""; pending=0; ring_ts=0; shown=0; shown_ts=0; prev_prompt="-"; turn_cost=""; turn_ctx=0
-  last_call=0; ttl=0; ring_acc=0
-  [ -r "$state" ] && IFS=' ' read -r last pending ring_ts shown shown_ts prev_prompt turn_cost turn_ctx last_call ttl ring_acc < "$state" 2>/dev/null
-  # A state file written before the ring had modes stops at ttl, and read leaves
-  # the field it never wrote empty rather than absent.
-  [ -n "${ring_acc:-}" ] || ring_acc=0
-
   # The turn handed back while we were not looking. Consumed on sight whether or
   # not it becomes a ring — it happened once, and if no money moved with it there
   # is nothing to announce. Under a shared ring it is consumed only once this
   # session holds the lock, or a halt would be swallowed by a lock it lost.
   if [ "$RING" = on_halt ]; then
-    halt="$RUN/rtc-${session:-nosession}.halt"
+    halt="$RUN/$tag-${session:-nosession}.halt"
     if [ -e "$halt" ]; then
       halted=1
       [ "$SCOPE" = session ] && { rm -f "$halt" 2>/dev/null || true; }
@@ -296,7 +505,7 @@ cmd_statusline() {
 
     if [ "$bump" != "0.000000" ]; then
       last_call=$now
-      record_sample "$bump" "$used" "$cwrite" "$cread" "${session:-nosession}" "$ratefile"
+      record_sample "$bump" "$used" "$cwrite" "$cread" "$tag-${session:-nosession}" "$ratefile"
     fi
 
     if [ "$pulse" = 1 ]; then shown=$pending; shown_ts=$now; pending=0; fi
@@ -333,13 +542,13 @@ cmd_statusline() {
     [ -n "${transcript:-}" ] && ttl=$(detect_ttl "$transcript" || printf '%s' "${ttl:-0}")
   fi
 
-  printf '%s %s %s %s %s %s %s %s %s %s %s\n' "$cost" "$pending" "$ring_ts" "$shown" "$shown_ts" \
+  printf '%s %s %s %s %s %s %s %s %s %s %s %s\n' "$cost" "$pending" "$ring_ts" "$shown" "$shown_ts" \
     "$prev_prompt" "${turn_cost:-$cost}" "${turn_ctx:-$used}" "${last_call:-0}" "${ttl:-0}" \
-    "${ring_acc:-0}" \
+    "${ring_acc:-0}" "${woffset:-0}" \
     > "$state.tmp" 2>/dev/null && mv -f "$state.tmp" "$state" 2>/dev/null || true
 
   # Context, parked where the band hook can read it.
-  printf '%s %s\n' "$used" "$size" > "$RUN/rtc-${session:-nosession}.ctx" 2>/dev/null || true
+  printf '%s %s\n' "$used" "$size" > "$RUN/$tag-${session:-nosession}.ctx" 2>/dev/null || true
 
   [ "$ring" = 1 ] && play_sound
 
@@ -351,13 +560,13 @@ cmd_statusline() {
     # only rebuilt when something it depends on moves. A fade in progress
     # changes the line every frame and is never cached.
     local cache key fading=0 age fade_int=${FADE%.*} minute=0
-    cache="$RUN/rtc-${session:-nosession}.line"
+    cache="$RUN/$tag-${session:-nosession}.line"
     # The cache clock moves on its own, so the key carries a minute counter —
     # otherwise a window could go cold behind a cached line that still claims it
     # is warm. One extra render a minute, not one a second.
     [ "${ttl:-0}" != "0" ] && [ "${last_call%.*}" != "0" ] &&
       minute=$(( ( ${now%.*} - ${last_call%.*} ) / 60 ))
-    key="$used|$size|$cost|$prompt|$minute"
+    key="$used|$size|$cost|$prompt|$minute|$noprice"
 
     if [ "${shown_ts%.*}" != "0" ]; then
       age=$(( ${now%.*} - ${shown_ts%.*} ))
@@ -371,9 +580,14 @@ cmd_statusline() {
     fi
 
     if [ -z "$segment" ]; then
-      local est=""
-      [ "$ESTIMATE" != "0" ] && est=$(estimate "${session:-nosession}" "$used" "${last_call:-0}" "${ttl:-0}" "$now" "$ratefile" 2>/dev/null)
-      segment=$(render "$model" "$effort" "$used" "$size" "$cost" "$shown" "$shown_ts" "$now" "${est:-}")
+      local est="" disp_cost="$cost" disp_shown="$shown"
+      # A Kimi model with no rate shows the gauge and nothing about money —
+      # half a money display is worse than none. doctor says how to fix it.
+      if [ "$noprice" = 1 ]; then disp_cost=-1; disp_shown=0;
+      elif [ "$ESTIMATE" != "0" ]; then
+        est=$(estimate "$tag-${session:-nosession}" "$used" "${last_call:-0}" "${ttl:-0}" "$now" "$ratefile" 2>/dev/null)
+      fi
+      segment=$(render "$model" "$effort" "$used" "$size" "$disp_cost" "$disp_shown" "$shown_ts" "$now" "${est:-}")
       [ "$fading" = 0 ] && {
         printf '%s\n%s\n' "$key" "$segment" > "$cache.tmp" 2>/dev/null &&
           mv -f "$cache.tmp" "$cache" 2>/dev/null || true
@@ -433,7 +647,7 @@ detect_ttl() {
 # has suffered one, and otherwise from the write/read price ratio.
 estimate() {
   local sess="$1" ctx="$2" last_call="$3" ttl="$4" now="$5" ratefile="$6"
-  local turns="$RUN/rtc-$sess.turns" cold="$RUN/rtc-$sess.rebuilds"
+  local turns="$RUN/$sess.turns" cold="$RUN/$sess.rebuilds"
   # This session's own turns are the better evidence. Fall back to what this
   # model has taught us before, so a fresh session is not blind.
   [ -r "$turns" ] || turns="$ratefile"
@@ -484,7 +698,9 @@ render() {
       out = out " " colour bar " " shown "%" RESET
       out = out " " DIM scale(used) " / " scale(size) RESET
     }
-    out = out sprintf(" %s$%.2f%s", DIM, cost, RESET)
+    # A negative cost is the noprice signal (Kimi model with no rate): the
+    # gauge renders, everything about money stays out.
+    if (cost + 0 >= 0) out = out sprintf(" %s$%.2f%s", DIM, cost, RESET)
 
     # What the next message is likely to cost, before it is sent. Dim while a
     # single turn is carrying the whole guess; full blue once the median has
@@ -506,7 +722,7 @@ render() {
     # The floating number. Age drives it, so a render landing at any moment gets
     # the right colour rather than a fixed frame.
     age = now - dts
-    if (dts > 0 && delta > 0 && age < fade) {
+    if (cost + 0 >= 0 && dts > 0 && delta > 0 && age < fade) {
       t = age / fade
       k = t < 0.15 ? 0 : (t - 0.15) / 0.85     # holds bright for a beat, then falls
       bold = t < 0.15 ? "\033[1m" : ""
@@ -532,20 +748,35 @@ play_sound() {
 
 # ── context band hook ─────────────────────────────────────────────────────────
 cmd_hook() {
-  local payload session ctx used size band last state
+  local payload platform tag session ctx used size band last state
   payload=$(cat)
+  # Kimi hook payloads name their event; Claude ones do not. Both carry
+  # session_id. Only the reply format differs: Kimi appends stdout to the
+  # context as plain text, Claude wants a systemMessage JSON object.
+  platform=$(printf '%s' "$payload" | jq -r 'if .hook_event_name != null then "kimi" else "claude" end' 2>/dev/null)
   session=$(printf '%s' "$payload" | jq -r '.session_id // empty' 2>/dev/null)
   [ -n "$session" ] || exit 0
+  tag=rtc
+  [ "$platform" = kimi ] && tag=rtc-kimi
 
-  ctx="$RUN/rtc-${session}.ctx"
+  ctx="$RUN/$tag-${session}.ctx"
   if [ ! -r "$ctx" ]; then
     # Installed but never set up. The hooks wire themselves and the statusline
     # cannot, so this is the one failure mode a new user will actually hit —
     # say it once rather than sitting there silently doing nothing.
-    local nudge="$RUN/rtc-${session}.nudged"
-    if [ ! -e "$nudge" ] && ! jq -e '.statusLine.command // "" | test("realtokencost")' "$SETTINGS" >/dev/null 2>&1; then
+    local nudge="$RUN/$tag-${session}.nudged" wired=1
+    if [ "$platform" = kimi ]; then
+      grep -q 'bin/rtc' "$KIMI_TUI" 2>/dev/null || wired=0
+    else
+      jq -e '.statusLine.command // "" | test("realtokencost")' "$SETTINGS" >/dev/null 2>&1 || wired=0
+    fi
+    if [ "$wired" = 0 ] && [ ! -e "$nudge" ]; then
       : > "$nudge" 2>/dev/null || true
-      jq -n '{systemMessage: "realtokencost is installed but not wired to the statusline, which is the only place Claude Code exposes cost and context. Run /realtokencost:setup"}'
+      if [ "$platform" = kimi ]; then
+        printf 'realtokencost is installed but not wired to the status line, which is the only place Kimi Code exposes context. Run /realtokencost:setup\n'
+      else
+        jq -n '{systemMessage: "realtokencost is installed but not wired to the statusline, which is the only place Claude Code exposes cost and context. Run /realtokencost:setup"}'
+      fi
     fi
     exit 0
   fi
@@ -556,7 +787,7 @@ cmd_hook() {
   band=$(( used * 100 / size / BANDS ))
   [ "$band" -ge 1 ] || exit 0
 
-  state="$RUN/rtc-${session}.band"
+  state="$RUN/$tag-${session}.band"
   last=0
   [ -r "$state" ] && last=$(cat "$state" 2>/dev/null)
   case "$last" in ''|*[!0-9]*) last=0 ;; esac
@@ -566,8 +797,12 @@ cmd_hook() {
   # Report where the window actually is. The band is only what triggered this —
   # saying "40%" while the window sits at 45% disagrees with the statusline for
   # no reason, and the statusline is right.
-  jq -n --arg m "context $(awk -v u="$used" -v s="$size" 'BEGIN { printf "%d", u * 100 / s }')% used — $(human "$used") of $(human "$size") tokens" \
-    '{systemMessage: $m}'
+  local msg="context $(awk -v u="$used" -v s="$size" 'BEGIN { printf "%d", u * 100 / s }')% used — $(human "$used") of $(human "$size") tokens"
+  if [ "$platform" = kimi ]; then
+    printf '%s\n' "$msg"
+  else
+    jq -n --arg m "$msg" '{systemMessage: $m}'
+  fi
 }
 
 human() { awk -v n="$1" 'BEGIN { printf (n >= 1000000 ? "%.2fM" : "%.0fk"), n / (n >= 1000000 ? 1000000 : 1000) }'; }
@@ -588,36 +823,54 @@ human() { awk -v n="$1" 'BEGIN { printf (n >= 1000000 ? "%.2fM" : "%.0fk"), n / 
 # so a marker is never left sitting for longer than that.
 cmd_halt() {
   [ "$RING" = on_halt ] || exit 0
-  local session
-  session=$(jq -r '.session_id // empty' 2>/dev/null)
+  local payload platform session tag
+  payload=$(cat)
+  IFS=$'\t' read -r platform session < <(
+    printf '%s' "$payload" | jq -r '[(if .hook_event_name != null then "kimi" else "claude" end), (.session_id // "")] | @tsv' 2>/dev/null
+  )
   [ -n "$session" ] || exit 0
-  : > "$RUN/rtc-$session.halt" 2>/dev/null || true
+  tag=rtc
+  [ "$platform" = kimi ] && tag=rtc-kimi
+  : > "$RUN/$tag-$session.halt" 2>/dev/null || true
 }
 
 # ── setup ─────────────────────────────────────────────────────────────────────
+# Setup is per platform, one config file between them. Each platform wires its
+# own native slot: Claude's settings.json statusLine, Kimi's tui.toml
+# [status_line].command plus hooks in config.toml (unless running from a Kimi
+# plugin managed copy, whose manifest already declares them).
 cmd_setup() {
   command -v jq >/dev/null 2>&1 || die "realtokencost needs jq."
-  [ -f "$SETTINGS" ] || die "no settings.json at $SETTINGS"
+  local did=0
+  if [ -f "$SETTINGS" ]; then setup_claude; did=1; fi
+  if [ -d "$KIMI_HOME" ]; then setup_kimi; did=1; fi
+  [ "$did" = 1 ] || die "found neither $SETTINGS nor $KIMI_HOME — is Claude Code or Kimi Code installed?"
+}
 
+# Never chain to ourselves, under any name we have ever had. Re-running setup,
+# moving from a checkout to an installed copy, or renaming the project would
+# otherwise wire this into its own chain and render the gauge twice, with the
+# two copies fighting over one state file. The rename to realtokencost proved
+# the point: a guard that knew only the current name promptly chained the
+# abandoned cha-ching binary, which was still sitting in the plugin cache.
+chain_maybe() {
+  local current="$1"
+  [ -n "$current" ] && [ "$current" != "$SELF" ] || return 0
+  printf '%s' "$current" | grep -qE 'realtokencost|cha-ching|/rtc([[:space:]]|$)' && return 0
+  mkdir -p "$CONFIG_DIR"
+  if grep -q '^RTC_CHAIN=' "$CONFIG" 2>/dev/null; then
+    printf '  keeping the chain already in %s\n' "$CONFIG"
+  else
+    printf 'RTC_CHAIN=%s\n' "$current" >> "$CONFIG"
+    printf '  chaining to your existing statusline: %s\n' "$current"
+  fi
+}
+
+setup_claude() {
+  printf 'claude: %s\n' "$SETTINGS"
   local current backup tmp
   current=$(jq -r '.statusLine.command // empty' "$SETTINGS")
-
-  # Never chain to ourselves, under any name we have ever had. Re-running setup,
-  # moving from a checkout to an installed copy, or renaming the project would
-  # otherwise wire this into its own chain and render the gauge twice, with the
-  # two copies fighting over one state file. The rename to realtokencost proved
-  # the point: a guard that knew only the current name promptly chained the
-  # abandoned cha-ching binary, which was still sitting in the plugin cache.
-  if [ -n "$current" ] && [ "$current" != "$SELF" ] &&
-     ! printf '%s' "$current" | grep -qE 'realtokencost|cha-ching|/rtc([[:space:]]|$)'; then
-    mkdir -p "$CONFIG_DIR"
-    if grep -q '^RTC_CHAIN=' "$CONFIG" 2>/dev/null; then
-      printf 'keeping the chain already in %s\n' "$CONFIG"
-    else
-      printf 'RTC_CHAIN=%s\n' "$current" >> "$CONFIG"
-      printf 'chaining to your existing statusline: %s\n' "$current"
-    fi
-  fi
+  chain_maybe "$current"
 
   backup="$SETTINGS.realtokencost.bak"
   cp "$SETTINGS" "$backup"
@@ -627,22 +880,216 @@ cmd_setup() {
      "$SETTINGS" > "$tmp" && jq empty "$tmp" && mv "$tmp" "$SETTINGS" \
     || die "failed to write $SETTINGS (backup at $backup)"
 
-  printf 'statusLine claimed. Backup at %s\n' "$backup"
-  printf 'Restart Claude Code.\n'
+  printf '  statusLine claimed. Backup at %s\n' "$backup"
+  printf '  restart Claude Code — statusLine is read at startup.\n'
+}
+
+# The first command = line inside the [status_line] section, unquoted.
+kimi_tui_command() {
+  [ -f "$KIMI_TUI" ] || return 1
+  awk '
+    /^\[status_line\][[:space:]]*$/ { insl=1; next }
+    /^\[/ { insl=0 }
+    insl && /^[[:space:]]*command[[:space:]]*=/ {
+      sub(/^[^=]*=[[:space:]]*/, ""); gsub(/^["'\'']|["'\'']$/, ""); print; exit
+    }' "$KIMI_TUI"
+}
+
+# Write [status_line].command into tui.toml without disturbing anything else:
+# replace an existing command line, insert into an existing section, or append
+# the section. tui.toml is small and user-owned, so back it up first.
+kimi_write_tui() {
+  local backup tmp
+  backup="$KIMI_TUI.realtokencost.bak"
+  [ -f "$KIMI_TUI" ] && cp "$KIMI_TUI" "$backup"
+  tmp=$(mktemp)
+  if [ ! -f "$KIMI_TUI" ]; then
+    printf '[status_line]\ncommand = "%s"\n' "$SELF" > "$tmp" || return 1
+  else
+    awk -v cmd="$SELF" '
+      /^\[status_line\][[:space:]]*$/ { insl=1; seen=1; print; next }
+      /^\[/ {
+        if (insl && !done) print "command = \"" cmd "\""
+        insl=0; done=0; print; next
+      }
+      insl && /^[[:space:]]*command[[:space:]]*=/ {
+        if (!done) { print "command = \"" cmd "\""; done=1 }
+        next
+      }
+      { print }
+      END {
+        if (insl && !done) print "command = \"" cmd "\""
+        if (!seen) { print ""; print "[status_line]"; print "command = \"" cmd "\"" }
+      }' "$KIMI_TUI" > "$tmp" || { rm -f "$tmp"; return 1; }
+  fi
+  [ -s "$tmp" ] && mv "$tmp" "$KIMI_TUI" || { rm -f "$tmp"; return 1; }
+}
+
+setup_kimi() {
+  printf 'kimi: %s\n' "$KIMI_HOME"
+
+  local current
+  current=$(kimi_tui_command)
+  chain_maybe "$current"
+  kimi_write_tui || die "failed to write $KIMI_TUI"
+  printf '  status_line claimed in tui.toml%s\n' "$([ -f "$KIMI_TUI.realtokencost.bak" ] && printf ' (backup alongside)')"
+
+  # Hooks. A Kimi plugin managed copy declares them in kimi.plugin.json; a
+  # plain checkout needs them appended to config.toml, marked so uninstall can
+  # find the block again.
+  case "$SELF" in
+    "$KIMI_HOME"/plugins/managed/*)
+      printf '  hooks: from the plugin manifest — nothing to write\n' ;;
+    *)
+      if grep -q 'bin/rtc' "$KIMI_CONF" 2>/dev/null; then
+        printf '  hooks: already wired in config.toml\n'
+      else
+        [ -f "$KIMI_CONF" ] && cp "$KIMI_CONF" "$KIMI_CONF.realtokencost.bak"
+        cat >> "$KIMI_CONF" <<EOF
+
+# >>> realtokencost — rtc uninstall removes this block
+[[hooks]]
+event = "UserPromptSubmit"
+command = "$SELF hook"
+
+[[hooks]]
+event = "Stop"
+command = "$SELF halt"
+
+[[hooks]]
+event = "Notification"
+command = "$SELF halt"
+# <<< realtokencost
+EOF
+        printf '  hooks: appended to config.toml (backup alongside)\n'
+      fi ;;
+  esac
+
+  printf '  run /reload-tui (or restart Kimi Code) to pick up the status line.\n'
+  cmd_rates || true
+}
+
+# Kimi reports usage, never dollars — the money features price measured tokens
+# from these rates, so there is nothing to show without them. An
+# RTC_PRICE_<model> config line always wins; this command is the other source:
+# what models.dev publishes for the models in config.toml, cached per model.
+# Nothing is guessed: an unmatched model gets instructions, not a number.
+cmd_rates() {
+  [ -f "$KIMI_CONF" ] || { printf 'rates: no %s — nothing to price\n' "$KIMI_CONF"; return 1; }
+  command -v curl >/dev/null 2>&1 || { printf 'rates: needs curl\n'; return 1; }
+  command -v jq >/dev/null 2>&1 || die "realtokencost needs jq."
+
+  local pairs api
+  # "alias<TAB>model id" for every [models.*] table
+  pairs=$(awk '
+    /^\[models\./ {
+      hdr=$0; sub(/^\[models\./, "", hdr); sub(/\][[:space:]]*$/, "", hdr)
+      sub(/\.overrides$/, "", hdr); gsub(/"/, "", hdr); alias=hdr; inm=1; next
+    }
+    /^\[/ { inm=0 }
+    inm && /^[[:space:]]*model[[:space:]]*=/ {
+      v=$0; sub(/^[^=]*=[[:space:]]*/, "", v); gsub(/"/, "", v)
+      print alias "\t" v
+    }' "$KIMI_CONF")
+  [ -n "$pairs" ] || { printf 'rates: no [models.*] tables in %s\n' "$KIMI_CONF"; return 1; }
+
+  printf 'rates: fetching models.dev…\n'
+  api=$(curl -fsSL --max-time 30 https://models.dev/api.json 2>/dev/null) || {
+    printf 'rates: fetch failed — set prices by hand instead, e.g.\n'
+    printf '  RTC_PRICE_kimi_code_k3="2.0 0.20 2.5 8.0"   (input cache_read cache_write output, $/M) in %s\n' "$CONFIG"
+    return 1
+  }
+  printf '%s' "$api" | jq empty 2>/dev/null || { printf 'rates: models.dev returned unparseable JSON — nothing written\n'; return 1; }
+
+  local alias mid san key provider input output cr cw hits line
+  printf '%s\n' "$pairs" | while IFS=$'\t' read -r alias mid; do
+    [ -n "$mid" ] || continue
+    san=$(printf '%s' "$alias" | tr -c 'A-Za-z0-9._-' '_')
+    hits=$(printf '%s' "$api" | jq -r --arg m "$mid" '
+      to_entries[] | .key as $p | (.value.models // {}) | to_entries[] |
+      select(.key == $m or .key == ("kimi-" + $m)) |
+      [$p, .key, (.value.cost.input // ""), (.value.cost.output // ""),
+       (.value.cost.cache_read // ""), (.value.cost.cache_write // "")] | @tsv')
+    if [ -z "$hits" ]; then
+      printf '  %-28s no models.dev match for "%s" — set RTC_PRICE_%s="input cache_read cache_write output" in %s\n' \
+        "$alias" "$mid" "$(printf '%s' "$san" | tr -c 'A-Za-z0-9_' '_')" "$CONFIG"
+      continue
+    fi
+    # A model id like kimi-k3 is carried by two dozen gateways, and the first
+    # one in the file is not the number a "what would this cost on the API"
+    # question asks for. Prefer the first-party provider, then any entry that
+    # publishes a non-zero price — a subscription plan lists $0, which answers
+    # a different question.
+    local nhits
+    nhits=$(printf '%s\n' "$hits" | wc -l); nhits=$((nhits))
+    line=$(printf '%s\n' "$hits" | awk -F'\t' '$1 == "moonshotai" { print; exit }')
+    [ -n "$line" ] || line=$(printf '%s\n' "$hits" | awk -F'\t' '$1 == "moonshotai-cn" { print; exit }')
+    [ -n "$line" ] || line=$(printf '%s\n' "$hits" | awk -F'\t' '$3 + 0 > 0 { print; exit }')
+    [ -n "$line" ] || line=$(printf '%s\n' "$hits" | head -1)
+    IFS=$'\t' read -r provider key input output cr cw <<< "$line"
+    if [ "$(awk -v a="${input:-0}" -v b="${output:-0}" 'BEGIN { print (a + b > 0) ? 1 : 0 }')" = 0 ]; then
+      printf '  %-28s only %s publishes %s, at $0 — a subscription plan, not an API price.\n' "$alias" "$provider" "$key"
+      printf '  %-28s set RTC_PRICE_%s="input cache_read cache_write output" in %s\n' \
+        "" "$(printf '%s' "$san" | tr -c 'A-Za-z0-9_' '_')" "$CONFIG"
+      continue
+    fi
+    # A cache rate nobody publishes is not a reason to stay silent — the plain
+    # input rate is the honest floor, and the file says which fields fell back.
+    local note=""
+    [ -n "$cr" ] || { cr=$input; note="$note cache_read=input"; }
+    [ -n "$cw" ] || { cw=$input; note="$note cache_write=input"; }
+    mkdir -p "$CACHE_DIR"
+    # Atomic: a render can read this file at any moment, including mid-refresh.
+    printf '%s %s %s %s models.dev:%s/%s %s%s\n' "$input" "$cr" "$cw" "$output" \
+      "$provider" "$key" "$(date +%F)" "$note" > "$CACHE_DIR/price-$san.tmp" 2>/dev/null &&
+      mv -f "$CACHE_DIR/price-$san.tmp" "$CACHE_DIR/price-$san" 2>/dev/null || rm -f "$CACHE_DIR/price-$san.tmp"
+    printf '  %-28s %s/%s — in $%s read $%s write $%s out $%s /M%s%s\n' \
+      "$alias" "$provider" "$key" "$input" "$cr" "$cw" "$output" "$note" \
+      "$([ "$nhits" -gt 1 ] && printf ' (of %s candidates)' "$nhits")"
+  done
+  : > "$CACHE_DIR/.rates-when" 2>/dev/null || true
 }
 
 cmd_uninstall() {
   local chain tmp
   chain=$(sed -n 's/^RTC_CHAIN=//p' "$CONFIG" 2>/dev/null | head -1)
-  tmp=$(mktemp)
-  if [ -n "$chain" ]; then
-    jq --arg cmd "$chain" '.statusLine = {"type":"command","command":$cmd}' "$SETTINGS" > "$tmp"
-    printf 'restored your statusline: %s\n' "$chain"
-  else
-    jq 'del(.statusLine)' "$SETTINGS" > "$tmp"
-    printf 'removed the statusline entry.\n'
+
+  if [ -f "$SETTINGS" ]; then
+    tmp=$(mktemp)
+    if [ -n "$chain" ]; then
+      jq --arg cmd "$chain" '.statusLine = {"type":"command","command":$cmd}' "$SETTINGS" > "$tmp"
+      printf 'claude: restored your statusline: %s\n' "$chain"
+    else
+      jq 'del(.statusLine)' "$SETTINGS" > "$tmp"
+      printf 'claude: removed the statusline entry.\n'
+    fi
+    jq empty "$tmp" && mv "$tmp" "$SETTINGS" || die "failed to write $SETTINGS"
   fi
-  jq empty "$tmp" && mv "$tmp" "$SETTINGS" || die "failed to write $SETTINGS"
+
+  if [ -f "$KIMI_TUI" ]; then
+    tmp=$(mktemp)
+    # Remove our command line (putting back the chain, if there is one), drop
+    # the marked hooks block, leave everything else alone.
+    awk -v chain="$chain" '
+      /^\[status_line\][[:space:]]*$/ { insl=1; print; next }
+      /^\[/ { insl=0; print; next }
+      insl && /^[[:space:]]*command[[:space:]]*=/ {
+        if ($0 ~ /bin\/rtc/) {
+          if (chain != "") print "command = \"" chain "\""
+          next
+        }
+        print; next
+      }
+      { print }' "$KIMI_TUI" > "$tmp" && [ -s "$tmp" ] && mv "$tmp" "$KIMI_TUI" || rm -f "$tmp"
+    printf 'kimi: status_line handed back%s\n' "$([ -n "$chain" ] && printf ' (chained to %s)' "$chain")"
+  fi
+  if grep -q '^# >>> realtokencost' "$KIMI_CONF" 2>/dev/null; then
+    tmp=$(mktemp)
+    awk '/^# >>> realtokencost/ { skip=1; next }
+         /^# <<< realtokencost/ { skip=0; next }
+         !skip { print }' "$KIMI_CONF" > "$tmp" && mv "$tmp" "$KIMI_CONF"
+    printf 'kimi: hooks block removed from config.toml\n'
+  fi
   printf 'Config left at %s — delete it if you are done.\n' "$CONFIG"
 }
 
@@ -728,6 +1175,70 @@ cmd_doctor() {
     printf '              run: rtc setup\n'
   fi
 
+  if [ -d "$KIMI_HOME" ]; then
+    local kwired
+    kwired=$(kimi_tui_command)
+    if [ "$kwired" = "$SELF" ]; then
+      printf '  kimi line   wired in %s\n' "$KIMI_TUI"
+    else
+      printf '  kimi line   NOT wired — currently %s\n' "${kwired:-none}"
+      printf '              run: rtc setup\n'
+    fi
+    case "$SELF" in
+      "$KIMI_HOME"/plugins/managed/*)
+        printf '  kimi hooks  from the plugin manifest\n' ;;
+      *)
+        if grep -q 'bin/rtc' "$KIMI_CONF" 2>/dev/null; then
+          printf '  kimi hooks  wired in config.toml\n'
+        else
+          printf '  kimi hooks  MISSING — band warnings and halt rings will not fire\n'
+          printf '              run: rtc setup\n'
+        fi ;;
+    esac
+
+    # Money under Kimi is measured tokens times a rate, so a model with no rate
+    # is a silent money display — say where every known rate came from and
+    # which live model has none.
+    local kc
+    for kc in $(grep -s '^RTC_PRICE_' "$CONFIG" | cut -d= -f1); do
+      printf '  kimi price  %s — config override in %s\n' "${kc#RTC_PRICE_}" "$CONFIG"
+    done
+    local pf pm
+    for pf in "$CACHE_DIR"/price-*; do
+      [ -r "$pf" ] || continue
+      pm=$(stat -c %Y "$pf" 2>/dev/null || stat -f %m "$pf" 2>/dev/null || printf '0')
+      printf '  kimi price  %s — %s\n' "${pf##*/price-}" "$(cut -d' ' -f5- < "$pf")"
+      awk -v m="${pm:-0}" -v n="$(now_s)" -v max="${RTC_RATES_MAX_AGE_DAYS:-30}" 'BEGIN {
+        d = (n - m) / 86400
+        printf "              cache %d day(s) old%s\n", d,
+          (d > max) ? " — stale, a detached refresh fires on the next render" : "" }'
+    done
+    local sf ksess kalias kmid
+    while read -r sf; do
+      case "$sf" in */rtc-kimi-*) ;; *) continue ;; esac
+      ksess=${sf##*/rtc-kimi-}; ksess=${ksess%.state}
+      kalias=""
+      [ -r "$RUN/rtc-kimi-$ksess.wire" ] && { read -r _; read -r kalias; } < "$RUN/rtc-kimi-$ksess.wire" 2>/dev/null
+      if [ -z "$kalias" ]; then
+        printf '  kimi wire   %.8s — no usage rows seen yet (money starts with the first request)\n' "$ksess"
+        continue
+      fi
+      kmid=$(printf '%s' "$kalias" | tr -c 'A-Za-z0-9._-' '_')
+      if ! price_for "$kmid"; then
+        printf '  kimi price  %s — NO RATE, money features are off for this model\n' "$kalias"
+        printf '              fix: rtc rates, or RTC_PRICE_%s="input cache_read cache_write output" in %s\n' \
+          "$(printf '%s' "$kmid" | tr -c 'A-Za-z0-9_' '_')" "$CONFIG"
+      elif [ "$PRICE_SRC" = seed ]; then
+        printf '  kimi price  %s — bundled seed (see share/prices.tsv for its date); the cache\n' "$kalias"
+        printf '              freshens itself on render, or run: rtc rates\n'
+      fi
+    done < <(live_states)
+    # Kimi publishes no cache TTL, so the estimate there never carries the
+    # expiring/cold countdown — it shows the warm figure only. Say so once,
+    # here, rather than letting the missing bracket look like a bug.
+    printf '  kimi ttl    unpublished — estimates show the warm price, no expiry countdown\n'
+  fi
+
   [ -n "${RTC_CHAIN:-}" ] && printf '  chain       %s\n' "$RTC_CHAIN"
 
   ok=$(live_states | wc -l); ok=$((ok))
@@ -795,8 +1306,9 @@ case "${1:-statusline}" in
   halt)       cmd_halt ;;
   setup)      cmd_setup ;;
   uninstall)  cmd_uninstall ;;
+  rates)      cmd_rates ;;
   doctor)     cmd_doctor ;;
   -h|--help|help)
-    sed -n '2,20p' "$SELF" | sed 's/^# \{0,1\}//' ;;
-  *) die "unknown command: $1 (try: statusline, hook, halt, setup, uninstall, doctor)" ;;
+    sed -n '2,27p' "$SELF" | sed 's/^# \{0,1\}//' ;;
+  *) die "unknown command: $1 (try: statusline, hook, halt, setup, uninstall, rates, doctor)" ;;
 esac

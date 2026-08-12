@@ -2,7 +2,7 @@
 
 **What the context in front of you actually costs — before you press enter.**
 
-A Claude Code statusline segment and hook. `rtc` for short.
+A statusline segment and hook for Claude Code and Kimi Code. `rtc` for short.
 
 ```
 Opus 5  xhigh  █░░░░░░░░░ 18%  182k / 1.00M  $9.76  [~$0.18]  +$0.03
@@ -67,6 +67,53 @@ CC=$(ls -d ~/.claude/plugins/cache/realtokencost/realtokencost/*/ | sort -V | ta
 Installed plugins live under a version directory and old versions are kept, so the path is
 `~/.claude/plugins/cache/realtokencost/realtokencost/<version>/bin/rtc` — hence picking the highest.
 
+### Kimi Code
+
+```bash
+kimi plugins install https://github.com/api-haus/realtokencost   # or /plugins in the TUI
+```
+
+The Kimi plugin manifest wires the hooks. The status line needs the same extra step for the same
+reason — `[status_line].command` lives in `tui.toml`, not in any plugin manifest — so run setup
+once from the managed copy:
+
+```bash
+KC=$(ls -d ~/.kimi-code/plugins/managed/realtokencost | head -1)/bin/rtc
+"$KC" setup     # writes tui.toml, fetches prices, then prints what it did
+"$KC" doctor    # per-platform wiring, price provenance, the works
+```
+
+`rtc setup` detects every CLI you have installed and wires each in one run, chaining any status line
+command it finds in the way, and `/reload-tui` (or a restart) picks it up.
+
+**The money is measured, then priced — never tabled.** Kimi Code is subscription-based and reports
+no dollar cost anywhere. What it does record is exact per-request token usage — input, output, cache
+read, cache write — in the session's `wire.jsonl`. rtc tails that log (incrementally, from a saved
+offset — idle renders cost one `stat`) and prices the measured tokens, so the float, the ring and the
+`[~$…]` estimate all work exactly as they do under Claude Code.
+
+The rates have three tiers, in order: a config line that always wins —
+
+```
+RTC_PRICE_kimi_code_k3="3 0.30 3 15"   # input cache_read cache_write output, $ per million
+```
+
+— then the models.dev cache that `rtc rates` fetches for your configured models (run at setup, and
+self-refreshing: a cache older than `RTC_RATES_MAX_AGE_DAYS`, default 30, triggers one detached
+refetch from a render, throttled to one attempt per six hours; a failed fetch keeps the last good
+numbers) — then, lowest, a bundled seed in `share/prices.tsv`, dated and limited to models with a
+published first-party price, so a fresh install shows money before any fetch has run. `rtc doctor`
+shows which tier every model's number came from. A model with no rate anywhere — `kimi-for-coding`
+publishes no per-token price at all — gets the context gauge and warnings but no money display:
+half a money figure is worse than none, and doctor prints the exact line that fixes it.
+
+One honest gap: Kimi publishes no prompt-cache TTL, so on Kimi the estimate shows the warm figure
+without the amber/red expiry countdown. The dollars stay measured; only the clock is missing.
+
+OpenCode is not supported yet: it has no statusline-command integration point
+([opencode#30295](https://github.com/anomalyco/opencode/issues/30295)). When one lands, rtc's
+platform layer is where it goes.
+
 ## It composes
 
 Every statusline in this space is a total replacement: [ccstatusline](https://github.com/sirmalloc/ccstatusline),
@@ -109,6 +156,9 @@ shell.
 | `RTC_SAMPLES` | `12` | recent requests kept to calibrate it |
 | `RTC_SOUND` | bundled | path to your own wav |
 | `RTC_MUTE` | `0` | `1` keeps the number, drops the sound |
+| `RTC_PRICE_<model>` | — | Kimi only: `input cache_read cache_write output` in $/M. Beats the cache and the seed |
+| `RTC_RATES_MAX_AGE_DAYS` | `30` | Kimi price cache older than this self-refreshes on the next render |
+| `RTC_RATES_REFRESH` | `1` | `0` disables that auto-refresh |
 
 ## When it rings
 
@@ -263,7 +313,7 @@ so the figure never overstates and always agrees with the bar beside it.
 
 - `jq`
 - an audio player: `pw-play`, `paplay`, `aplay` (Linux) or `afplay` (macOS)
-- Claude Code ≥ 2.1.97 for `refreshInterval`
+- Claude Code ≥ 2.1.97 for `refreshInterval`, and/or Kimi Code ≥ 0.30 for `[status_line].command`
 
 Developed and tested on Linux. The macOS paths are written but untested — reports welcome.
 

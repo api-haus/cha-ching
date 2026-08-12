@@ -1,33 +1,60 @@
 # AGENTS.md
 
-realtokencost (`rtc`) is a Claude Code plugin: a statusline segment plus a hook. It shows what
-submitting the current context costs *before* you press enter, whether the prompt cache is still
-alive to make that the cheap number, rings a cash register when money moves, and warns as the window
-fills. `README.md` is written for users; this file is what you need to change the thing.
+realtokencost (`rtc`) is a plugin for Claude Code and Kimi Code: a statusline segment plus a hook.
+It shows what submitting the current context costs *before* you press enter, whether the prompt
+cache is still alive to make that the cheap number, rings a cash register when money moves, and
+warns as the window fills. `README.md` is written for users; this file is what you need to change
+the thing.
 
-Everything below was verified against Claude Code 2.1.227 by reading the binary and live payloads.
-Where a claim is checkable, the check is named. Re-verify rather than trust if a claim starts costing
-you time — the CLI moves.
+Everything below was verified against Claude Code 2.1.227 and Kimi Code 0.34.0 by reading the
+binaries and live payloads. Where a claim is checkable, the check is named. Re-verify rather than
+trust if a claim starts costing you time — both CLIs move.
 
 ## The constraints that shape the design
 
 Read these before proposing an architecture change. Each one has already been paid for.
 
-**A plugin cannot register a statusline.** `statusLine` is a settings key with no plugin path — there
-is no `pluginStatusLine` identifier in the binary. Hooks install themselves via `hooks/hooks.json`;
-the statusline needs `rtc setup` to write `settings.json`. This asymmetry is why setup exists at all.
+**A plugin cannot register a statusline.** `statusLine` is a settings key with no plugin path —
+there is no `pluginStatusLine` identifier in the binary. Hooks install themselves via
+`hooks/hooks.json`; the statusline needs `rtc setup` to write `settings.json`. This asymmetry is why
+setup exists at all. Kimi Code has the same asymmetry with different names: `kimi.plugin.json`
+carries hooks but `[status_line].command` lives in `tui.toml`, which only setup writes.
 
 **Hook payloads carry neither cost nor context.** `cost.total_cost_usd` and `context_window` are
 handed to the statusline and to nothing else. The request to expose context usage to hooks
 ([anthropics/claude-code#27969](https://github.com/anthropics/claude-code/issues/27969)) was closed as
 a duplicate. So the statusline harvests to files under `$XDG_RUNTIME_DIR` and the hook reads them
-there. That bridge is not a workaround to be cleaned up; it is the only path.
+there. That bridge is not a workaround to be cleaned up; it is the only path. Kimi is the same
+shape: the snapshot carries context, the hooks carry `session_id` and nothing else.
 
-**Never ship a price table.** The CLI has one compiled in (`inputTokens:5, outputTokens:25,
-promptCacheWriteTokens:6.25, promptCacheWrite1hTokens:10, promptCacheReadTokens:0.5` per million) and
-it is exactly what goes stale. `rtc` measures instead: each request bump says this much money bought a
-re-read of this much context. Validated against first principles on a live session — learned `$0.18`
-where `332,258 × $0.50/M` gives `$0.17`. Keep it that way.
+**Kimi reports tokens, never dollars.** Kimi Code is subscription-based; no payload, wire record or
+API exposes a cost. The money features survive because the session's
+`$KIMI_CODE_HOME/sessions/*/session_<id>/agents/main/wire.jsonl` records one `usage.record` row per
+request — `inputOther`, `output`, `inputCacheRead`, `inputCacheCreation` — and measured tokens
+times a rate is a price. Rates have three tiers, strict order: `RTC_PRICE_<model>` in the config
+(always wins), the `price-<model>` cache `rtc rates` writes from models.dev, the bundled seed in
+`share/prices.tsv`. A model with no rate anywhere gets gauge and warnings only; a half-shown money
+display is worse than none. Kimi publishes no cache TTL, so there the estimate never shows the
+expiring/cold countdown.
+
+**Never let a shipped price outrank a measured or fetched one.** The CLI has a price table compiled
+in (`inputTokens:5, outputTokens:25, promptCacheWriteTokens:6.25, promptCacheWrite1hTokens:10,
+promptCacheReadTokens:0.5` per million) and it is exactly what goes stale — Anthropic added the 1-hour
+cache tier and the read/write spread became 20×, not 20%. So Claude dollars are measured from the
+host, never priced: each request bump says this much money bought a re-read of this much context.
+Validated against first principles on a live session — learned `$0.18` where `332,258 × $0.50/M`
+gives `$0.17`.
+
+For Kimi there is nothing to measure dollars *from*, so after shipping rate-less for a version the
+owner called for a bundled seed (2026-08, the discussion is in the git log). It is kept honest by
+construction rather than by promise: last precedence (any config or cache line beats it), dated in
+the file, limited to models with a published first-party price — `kimi-for-coding` lists $0
+everywhere, so it gets no invented number — and self-replacing: a seed-sourced or
+`RTC_RATES_MAX_AGE_DAYS`-stale price makes the next render spawn one detached `rtc rates`
+(throttled to one attempt per six hours by `$CACHE_DIR/.rates-when`; a failed fetch keeps the last
+good numbers). `price_for` reports its tier in `PRICE_SRC` and doctor shows it, so a stale number
+is never silently stale. When editing the seed, update its bundle date — the date is the freshness
+bound.
 
 **`LC_ALL=C` at the top of the script is load-bearing.** Money and percentages are text all the way
 through. Under a comma-decimal locale `awk` and `printf` disagree about what `9.76` means and the
@@ -36,27 +63,43 @@ arithmetic silently stops working. Found on a Ukrainian-locale shell.
 **One API response writes several transcript records.** Text, thinking and each `tool_use` block get
 their own record, and every one carries the same `usage` object. Any transcript analysis must
 `group_by(.message.id)` first. Summing records inflated a measurement by roughly half before this was
-caught.
+caught. Kimi's wire is the opposite discipline: only `usage.record` rows count, and the same usage
+also appears inside `context.append_loop_event` `step.end` events — summing those would double it.
 
 **The version must bump for an update to reach an install.** Refreshing a marketplace does not
 re-fetch a plugin whose version has not moved. A fix left at the same version sits unreachable; this
 has already happened once.
 
+**Platform is detected from the payload, never configured.** A statusline payload with `sessionId`
+(camelCase) is Kimi; `session_id` (snake) is Claude. A hook payload with `hook_event_name` is Kimi.
+Kimi hook stdout must be plain text (it is appended to context verbatim); Claude wants
+`{"systemMessage": ...}` JSON. Kimi session files are prefixed `rtc-kimi-` so state never collides
+and `doctor` can tell them apart.
+
 ## Layout
 
 ```
-bin/rtc                      everything — one bash script, six subcommands
-hooks/hooks.json             UserPromptSubmit -> rtc hook; Stop, Notification -> rtc halt
-commands/setup.md            /realtokencost:setup
+bin/rtc                      everything — one bash script, seven subcommands
+hooks/hooks.json             Claude: UserPromptSubmit -> rtc hook; Stop, Notification -> rtc halt
+kimi.plugin.json             Kimi plugin manifest: same three hooks, ./kimi/commands/
+commands/setup.md            /realtokencost:setup (Claude)
+kimi/commands/setup.md       /realtokencost:setup (Kimi — command bodies are prompts there,
+                             so this one tells the agent how to find the managed copy)
 share/cash-register.wav      CC0, see share/ATTRIBUTION.md
+share/prices.tsv             bundled Kimi price seed — last precedence, dated, see the
+                             price rule under "constraints" before touching it
 .claude-plugin/plugin.json   plugin manifest
 .claude-plugin/marketplace.json   single-plugin marketplace, source "./"
 ```
 
-`rtc statusline` is what `statusLine.command` runs. `rtc hook`, `halt`, `setup`, `uninstall`,
-`doctor` are the rest. `doctor` exists to answer "why is it quiet" without a debugging session —
+`rtc statusline` is what the status line command runs (`statusLine.command` on Claude,
+`[status_line].command` on Kimi). `rtc hook`, `halt`, `setup`, `uninstall`, `rates`, `doctor` are
+the rest. `rates` fetches what models.dev publishes for the models in Kimi's `config.toml` into
+`$XDG_CACHE_HOME/realtokencost/price-<model>` — the Kimi money source alongside `RTC_PRICE_*`.
+`doctor` exists to answer "why is it quiet" without a debugging session —
 extend it when you add a way for things to be quiet. Every ring mode is one such way, and so is a
-shared ring, which is why each prints its own line there.
+shared ring, which is why each prints its own line there. A Kimi model with no rate is another —
+doctor prints the per-model provenance and the exact config line that fixes a missing one.
 
 **Nothing counts sessions by counting files.** Nothing ever deletes a state file — it lives until
 `$XDG_RUNTIME_DIR` is cleared at logout — so a glob counts every session the machine has run since
@@ -67,11 +110,12 @@ rather than `-newermt`, which is a GNU spelling that silently returns nothing un
 
 ## Runtime state
 
-Per session under `$XDG_RUNTIME_DIR` (falling back to `TMPDIR`), keyed by `session_id`:
+Per session under `$XDG_RUNTIME_DIR` (falling back to `TMPDIR`), keyed by `session_id`. Kimi
+sessions use the same files with an `rtc-kimi-` prefix instead of `rtc-`:
 
 | file | holds |
 |---|---|
-| `rtc-<id>.state` | ten space-separated fields, order below |
+| `rtc-<id>.state` | twelve space-separated fields, order below |
 | `rtc-<id>.turns` | recent ordinary request ratios, `$` per million tokens of context |
 | `rtc-<id>.rebuilds` | ratios from requests that rebuilt the cache — a different thing entirely |
 | `rtc-<id>.ctx` | `used size`, the bridge the hook reads |
@@ -79,6 +123,19 @@ Per session under `$XDG_RUNTIME_DIR` (falling back to `TMPDIR`), keyed by `sessi
 | `rtc-<id>.band` | highest context band already announced |
 | `rtc-<id>.halt` | the turn handed back; consumed by the next render |
 | `rtc-<id>.nudged` | set once when told to run setup |
+| `rtc-kimi-<id>.wire` | Kimi only: wire.jsonl path on line 1, model alias on line 2 |
+
+State field order, positional, read with one `read`:
+
+```
+cost pending ring_ts shown shown_ts prev_prompt turn_cost turn_ctx last_call ttl ring_acc woffset
+```
+
+`woffset` is the Kimi wire.jsonl byte offset; 0 on Claude. On Kimi `cost` is not host-reported —
+it is the running total rtc maintains by pricing new `usage.record` rows, and a first sight of a
+wire adopts its current size as the offset rather than announcing history (the same rule as a first
+cost sighting). The wire path lives in a side file, not the state file, because paths can contain
+characters the positional format cannot.
 
 State field order, positional, read with one `read`:
 
@@ -107,6 +164,25 @@ lock and winning it back.
 ## Things deliberately not done
 
 Do not "fix" these. Each was tried or considered and rejected for a reason.
+
+**OpenCode support.** It has no statusline-command integration point — the SolidJS status bar has no
+user slot, and the request for one
+([anomalyco/opencode#30295](https://github.com/anomalyco/opencode/issues/30295)) is open. The plugin
+API is TypeScript with toasts, which would be a second codebase for half the features. When a
+statusline slot lands, the payload-detection branch in `cmd_statusline` is where it plugs in.
+
+**Subagent spend.** Not counted on either platform, and today that is parity, not a gap: Claude's
+`total_cost_usd` covers the parent session only — child sessions bill separately and never roll up
+([claude-code#60591](https://github.com/anthropics/claude-code/issues/60591)) — and the Kimi tailer
+reads only `agents/main/wire.jsonl` while `agents/agent-N/wire.jsonl` rows go uncounted. The data
+exists on both sides (child transcripts; sibling wires), so this is a queued feature, not an
+impossibility: Claude first (transcript rollup — mind the `group_by(.message.id)` rule, one API
+response writes several records), then Kimi (enumerate the sibling wires, one offset each).
+
+**Learning Kimi's cache TTL.** No payload or wire record names it, and the hint dialog in the TUI
+proves the CLI knows it but does not print it. It could be bounded empirically (a rebuild after an
+idle gap is an upper bound, a hit a lower one) — deliberately not yet; the estimate simply shows the
+warm figure there.
 
 **Predicting what the turn will do.** An earlier version showed a range whose upper bound guessed how
 many tool calls Claude would make. That is a property of the work, not of the context, and no history
@@ -223,6 +299,25 @@ Feed successive renders with rising `cost` to exercise the ring, the fade and sa
 `session_id` and delete `$XDG_RUNTIME_DIR/rtc-<id>.*` between runs, or you will debug yesterday's
 state. `XDG_CACHE_HOME` to a temp dir keeps a test from teaching the real model rate.
 
+The Kimi drive is a snapshot plus a synthetic wire log — point `KIMI_CODE_HOME` at a scratch dir and
+append `usage.record` rows between renders to make requests happen:
+
+```bash
+mkdir -p "$K/sessions/proj/session_t/agents/main"
+SNAP='{"model":"K3","cwd":"/tmp","gitBranch":null,"permissionMode":"manual","planMode":false,
+"contextUsage":0.05,"contextTokens":55000,"maxContextTokens":1048576,"sessionId":"session_t",
+"version":"0.34.0"}'
+printf '%s' "$SNAP" | KIMI_CODE_HOME="$K" RTC_MUTE=1 RTC_PRICE_kimi_code_k3="3 0.3 3 15" bin/rtc
+printf '%s\n' '{"type":"usage.record","model":"kimi-code/k3","usage":{"inputOther":1207,
+"output":537,"inputCacheRead":55000,"inputCacheCreation":0},"usageScope":"turn","time":1}' \
+  >> "$K/sessions/proj/session_t/agents/main/wire.jsonl"   # then render again — a bump lands
+```
+
+The first render must adopt the wire's size and announce nothing; a render with no appended rows must
+add nothing; a row with `inputCacheCreation > inputCacheRead` must land in `.rebuilds`, not `.turns`.
+With no price at all the money display must vanish whole — gauge only — and reappear when one is set.
+
+
 Time-dependent behaviour — fade, cache expiry — is tested by rewriting the timestamp in the state
 file rather than sleeping. Rewrite it with `printf "%.6f"`; `awk`'s default output format turns an
 epoch into `1.78648e+09` and the test silently stops meaning anything.
@@ -239,13 +334,15 @@ same instant as the last bump is delivered on the render after it.
 ## Releasing
 
 ```bash
-# bump BOTH manifests — they are checked independently
-sed -i 's/"version": "X"/"version": "Y"/' .claude-plugin/plugin.json .claude-plugin/marketplace.json
+# bump ALL THREE manifests — they are checked independently
+sed -i 's/"version": "X"/"version": "Y"/' .claude-plugin/plugin.json .claude-plugin/marketplace.json kimi.plugin.json
 git commit && git push
 claude plugin marketplace update realtokencost
 claude plugin uninstall realtokencost@realtokencost
 claude plugin install realtokencost@realtokencost
 "$(ls -d ~/.claude/plugins/cache/realtokencost/realtokencost/*/ | sort -V | tail -1)bin/rtc" setup
+# kimi: /plugins install https://github.com/api-haus/realtokencost (reinstalls the managed copy),
+# then setup from it the same way; /reload-tui picks up tui.toml without a restart
 ```
 
 `setup` must be re-run after every install: it writes an absolute versioned path into `statusLine`,

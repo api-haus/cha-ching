@@ -1,0 +1,8 @@
+# Bundled price seed for Kimi Code models — the lowest-precedence rate source.
+# Config (RTC_PRICE_*) wins, then the models.dev cache written by `rtc rates`,
+# then this. Rates are $ per million tokens: input, cache_read, cache_write,
+# output. Only models with a published first-party price belong here — a model
+# nobody sells by the token gets no invented number. The bundle date is the
+# freshness bound; the render path self-refreshes the cache past it.
+# alias				input	cache_read	cache_write	output	source
+kimi-code/k3		3	0.3	3	15	moonshotai/kimi-k3 via models.dev, bundled 2026-08-12; cache_write=input

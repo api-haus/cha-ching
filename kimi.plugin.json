@@ -1,0 +1,38 @@
+{
+  "name": "realtokencost",
+  "version": "2.5.0",
+  "description": "Shows what submitting your current context costs before you send it, tracks whether the prompt cache is still alive, rings a cash register when money moves and warns as the window fills. Chains to any existing statusline instead of replacing it.",
+  "author": {
+    "name": "Kassinity"
+  },
+  "homepage": "https://github.com/api-haus/realtokencost",
+  "license": "MIT",
+  "keywords": [
+    "statusline",
+    "cost",
+    "tokens",
+    "context",
+    "prompt-cache",
+    "usage",
+    "budget"
+  ],
+  "interface": {
+    "displayName": "realtokencost — what the context in front of you actually costs",
+    "shortDescription": "Forward-looking context cost, cache warmth, and spend rings in your statusline"
+  },
+  "hooks": [
+    {
+      "event": "UserPromptSubmit",
+      "command": "./bin/rtc hook"
+    },
+    {
+      "event": "Stop",
+      "command": "./bin/rtc halt"
+    },
+    {
+      "event": "Notification",
+      "command": "./bin/rtc halt"
+    }
+  ],
+  "commands": "./kimi/commands/"
+}
