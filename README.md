@@ -98,7 +98,8 @@ The rates have three tiers, in order: a config line that always wins —
 RTC_PRICE_kimi_code_k3="3 0.30 3 15"   # input cache_read cache_write output, $ per million
 ```
 
-— then the models.dev cache that `rtc rates` fetches for your configured models (run at setup, and
+— then the models.dev cache that `rtc rates` fetches for your configured models and for any model
+your subagents turn out to be running, which need not be the same list (run at setup, and
 self-refreshing: a cache older than `RTC_RATES_MAX_AGE_DAYS`, default 30, triggers one detached
 refetch from a render, throttled to one attempt per six hours; a failed fetch keeps the last good
 numbers) — then, lowest, a bundled seed in `share/prices.tsv`, dated and limited to models with a
@@ -324,7 +325,10 @@ so the figure never overstates and always agrees with the bar beside it.
 - an audio player: `pw-play`, `paplay`, `aplay` (Linux) or `afplay` (macOS)
 - Claude Code ≥ 2.1.97 for `refreshInterval`, and/or Kimi Code ≥ 0.30 for `[status_line].command`
 
-Developed and tested on Linux. The macOS paths are written but untested — reports welcome.
+Developed on Linux. macOS is exercised in two halves rather than on a Mac — a BSD-shaped `PATH` with
+no `setsid` and no `tac`, and bash 3.2.57, which is still what `/bin/bash` is there. Both halves run
+the full drive suite; before 2.7.0 both were failing, and the ring had never made a sound on a Mac.
+Reports from a real one are still welcome.
 
 ## Contributing
 

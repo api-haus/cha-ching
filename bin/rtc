@@ -34,6 +34,11 @@ set -u
 export LC_ALL=C
 
 SELF=$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")
+# readlink -f is a GNU spelling that only reached macOS in 12.3, and without it
+# $0 is whatever the caller typed. A relative path here is not a cosmetic
+# problem: it is what setup writes into settings.json, and what ROOT — the
+# bundled price seed and the wav — is derived from.
+case "$SELF" in /*) ;; *) SELF="$PWD/$SELF" ;; esac
 HERE=$(dirname "$SELF")
 ROOT=$(dirname "$HERE")
 RUN=${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}
@@ -114,7 +119,38 @@ record_sample() {
     tail -n 40 "$ratefile" > "$ratefile.tmp" 2>/dev/null &&
     mv -f "$ratefile.tmp" "$ratefile" 2>/dev/null || true
 }
-now_s() { date +%s.%N 2>/dev/null || date +%s; }
+# Every clock in here reads this one: the ring cooldown, the fade, the cache
+# countdown, and the timestamp the ring lock is taken with. BSD date has no %N
+# and hands the conversion back unexpanded — macOS prints "1786499706.N" — and
+# that string fails every numeric guard downstream. Measured under a BSD
+# userland: the shared ring reads its own last-ring time as 0 and stops
+# enforcing the cooldown, and a live holder's lock stamp reads as 0, so the
+# next session to want the lock decides the holder died and takes it from it.
+# The mutex is the thing that keeps two sessions from both crossing $5 with one
+# write surviving, so trimming to the leading number is not tidying.
+#
+# Trim rather than probe: a second `date` on a platform that has no %N would be
+# a fork on the render path, every render, forever.
+now_s() {
+  local t
+  t=$(date +%s.%N 2>/dev/null)
+  case "$t" in *[!0-9.]*) t=${t%%[!0-9.]*}; t=${t%.} ;; esac
+  case "$t" in ''|*[!0-9.]*) t=$(date +%s 2>/dev/null) ;; esac
+  case "$t" in ''|*[!0-9.]*) t=0 ;; esac
+  printf '%s' "$t"
+}
+
+# setsid is util-linux and macOS does not ship it, which is not a degraded
+# detach there but no detach at all: `setsid` not found means the sound never
+# plays and the self-refreshing price fetch never runs. A plain background
+# subshell gets what this actually needs — the child is orphaned and reparented
+# the moment the subshell exits. setsid is still preferred where it exists,
+# since a new session also survives the terminal going away. `command -v` is a
+# builtin, so asking costs no process.
+detach() {
+  if command -v setsid >/dev/null 2>&1; then (setsid "$@" >/dev/null 2>&1 &) 2>/dev/null
+  else                                      ("$@" >/dev/null 2>&1 &) 2>/dev/null; fi
+}
 
 # The shared ring state, in two numbers: when it last spoke, and what it has not
 # announced yet. Read on every render under a global scope, so it is builtins
@@ -146,7 +182,7 @@ read_ring() {
 # from taking the statusline down with it; the money a giver-up is carrying is
 # safe where it is, and comes back on the next render.
 ring_lock() {
-  local f="$1" now="$2" held="" try=0
+  local f="$1" now="$2" held="" try=0 blank=0
   # Ten waits of 20ms. The section is a read, an awk and a write — a few
   # milliseconds — so this covers every open session piling onto it at the same
   # instant, which is the shape of the worst case: they render on the same timer.
@@ -159,9 +195,27 @@ ring_lock() {
     # A process killed between taking this and releasing it would silence every
     # session on the machine for as long as the file survived, so a lock nobody
     # has released in five seconds is taken from it.
-    held=0
+    held=""
     [ -r "$f" ] && read -r held < "$f" 2>/dev/null
-    case "${held:-}" in ''|*[!0-9.]*) held=0 ;; esac
+    case "${held:-}" in ''|*[!0-9.]*) held="" ;; esac
+
+    # Taking the lock is an O_EXCL open and then a write, so a contender can
+    # land between the two and read a file that exists and says nothing yet.
+    # That stamp is a holder a microsecond old. Reading it as epoch zero — as
+    # "unset, therefore ancient, therefore dead" — put two sessions in the
+    # section at once, and the second one's write overwrote the first one's:
+    # measured under ten-way contention as a lost dollar and a missing ring,
+    # rarely enough to look like a fluke. An unreadable stamp is only evidence
+    # of a corpse if it is still unreadable after the whole spin, which is what
+    # a process killed mid-take, or a version that wrote something else here,
+    # leaves behind.
+    if [ -z "$held" ]; then
+      blank=$((blank + 1))
+      [ "$blank" -ge 10 ] && { rm -f "$f" 2>/dev/null || true; }
+      sleep 0.02 2>/dev/null || true
+      continue
+    fi
+
     if [ $(( ${now%.*} - ${held%.*} )) -gt 5 ]; then
       rm -f "$f" 2>/dev/null || true
       continue
@@ -245,7 +299,7 @@ rates_maybe_refresh() {
   # should not earn a curl every second.
   [ $(( ${now%.*} - m )) -lt 21600 ] && return 0
   mkdir -p "$CACHE_DIR" 2>/dev/null && : > "$CACHE_DIR/.rates-when" 2>/dev/null || return 0
-  (setsid "$SELF" rates >/dev/null 2>&1 &) 2>/dev/null
+  detach "$SELF" rates
 }
 
 # Reads the complete lines past the wire offset and folds the usage.record rows
@@ -381,6 +435,14 @@ kimi_subagents() {
             alias=$m
             price_for "${m//[^A-Za-z0-9._-]/_}" &&
               terms="$terms$io $cr $cw $o $PRICE"$'\n'
+            # Nothing configures the model a subagent runs, so this is the only
+            # place its alias is ever learned. Ask for a fetch on the same terms
+            # the main model gets: a seed or a stale cache wants freshening, and
+            # a rate that is missing outright wants its first fetch — `rates`
+            # reads the sidecars now, so the alias it needs is one it can find.
+            # Throttled to one attempt per six hours across the machine, and
+            # only reached on a render where this wire actually grew.
+            rates_maybe_refresh "${m//[^A-Za-z0-9._-]/_}"
           done <<< "${t#*$'\n'}" ;;
       esac
       off=$newoff
@@ -896,7 +958,7 @@ play_sound() {
   for p in pw-play paplay aplay afplay; do
     if command -v "$p" >/dev/null 2>&1; then
       # Detached, so a wedged audio server never stalls a render.
-      (setsid "$p" "$wav" >/dev/null 2>&1 &) 2>/dev/null
+      detach "$p" "$wav"
       return 0
     fi
   done
@@ -1125,19 +1187,33 @@ EOF
   cmd_rates || true
 }
 
+# One "alias<TAB>model id" line, unless the alias already has one. There is no
+# model id to pair a wire-discovered alias with, so its last path segment
+# stands in: "kimi-code/k3" asks models.dev for k3, and the lookup also tries
+# the "kimi-" prefix, which is the shape moonshotai publishes under.
+#
+# Runs inside cmd_rates. Edits pairs.
+rates_add_alias() {
+  local nl=$'\n' tab=$'\t'
+  case "${1:-}" in '') return 0 ;; esac
+  case "$nl$pairs" in *"$nl$1$tab"*) return 0 ;; esac
+  pairs="${pairs:+$pairs$nl}$1$tab${1##*/}"
+}
+
 # Kimi reports usage, never dollars — the money features price measured tokens
 # from these rates, so there is nothing to show without them. An
 # RTC_PRICE_<model> config line always wins; this command is the other source:
-# what models.dev publishes for the models in config.toml, cached per model.
+# what models.dev publishes, cached per model — for the models in config.toml
+# and for every alias a live wire has actually reported, which are not the same
+# roster.
 # Nothing is guessed: an unmatched model gets instructions, not a number.
 cmd_rates() {
-  [ -f "$KIMI_CONF" ] || { printf 'rates: no %s — nothing to price\n' "$KIMI_CONF"; return 1; }
   command -v curl >/dev/null 2>&1 || { printf 'rates: needs curl\n'; return 1; }
   command -v jq >/dev/null 2>&1 || die "realtokencost needs jq."
 
-  local pairs api
+  local pairs="" api
   # "alias<TAB>model id" for every [models.*] table
-  pairs=$(awk '
+  [ -f "$KIMI_CONF" ] && pairs=$(awk '
     /^\[models\./ {
       hdr=$0; sub(/^\[models\./, "", hdr); sub(/\][[:space:]]*$/, "", hdr)
       sub(/\.overrides$/, "", hdr); gsub(/"/, "", hdr); alias=hdr; inm=1; next
@@ -1147,7 +1223,32 @@ cmd_rates() {
       v=$0; sub(/^[^=]*=[[:space:]]*/, "", v); gsub(/"/, "", v)
       print alias "\t" v
     }' "$KIMI_CONF")
-  [ -n "$pairs" ] || { printf 'rates: no [models.*] tables in %s\n' "$KIMI_CONF"; return 1; }
+
+  # config.toml is not the whole roster. A model alias also arrives on the
+  # usage.record rows themselves, and a subagent's need never have a
+  # [models.*] table behind it — nothing configures the model a delegated agent
+  # runs. An alias reached only that way would never get a price-<model> file,
+  # so its spend would go quietly missing from a session whose own model looks
+  # perfectly fine. The sidecars are that second roster: the alias each live
+  # wire last reported. There is no model id to pair with, so the last path
+  # segment stands in — "kimi-code/k3" asks models.dev for k3, and the lookup
+  # below already tries the "kimi-" prefix as well.
+  local wf alias
+  for wf in "$RUN"/rtc-kimi-*.wire; do
+    [ -r "$wf" ] || continue
+    alias=""
+    { read -r _; read -r alias; } < "$wf" 2>/dev/null
+    rates_add_alias "$alias"
+  done
+  for wf in "$RUN"/rtc-kimi-*.subs; do
+    [ -r "$wf" ] || continue
+    while read -r _ _ alias; do rates_add_alias "${alias:-}"; done < "$wf"
+  done
+
+  [ -n "$pairs" ] || {
+    printf 'rates: no [models.*] tables in %s and no wire has named a model yet\n' "$KIMI_CONF"
+    return 1
+  }
 
   printf 'rates: fetching models.dev…\n'
   api=$(curl -fsSL --max-time 30 https://models.dev/api.json 2>/dev/null) || {

@@ -56,6 +56,29 @@ good numbers). `price_for` reports its tier in `PRICE_SRC` and doctor shows it, 
 is never silently stale. When editing the seed, update its bundle date — the date is the freshness
 bound.
 
+**macOS is supported and cannot be run here, so it is simulated in two halves.** Both halves found
+real bugs, so run both before believing a platform claim. `drive/matrix.sh` does it: a macOS-shaped
+`PATH` holding only the utilities macOS ships — BSD-behaving `stat` and `date`, and crucially no
+`setsid` and no `tac` — and bash 3.2.57 in a container, which is still what `/bin/bash` is there.
+What that turned up in 2.6.0, all three shipped and all three dead on arrival on a Mac:
+
+`setsid` is util-linux. macOS has none, and `(setsid "$p" "$wav" &)` there is not a degraded detach
+but no detach at all — the ring was silent on every Mac since the feature existed, and the
+self-refreshing price fetch never ran either. A background subshell orphans the child just as well;
+`setsid` only adds a new session, so it is used where it exists and skipped where it does not.
+
+BSD `date` has no `%N` and hands the conversion back unexpanded, so `now_s` returned
+`1786499706.N`. Every numeric guard downstream then read that as zero: the shared ring's last-ring
+time became 0 and stopped enforcing the cooldown, and a live lock holder's stamp became 0, so the
+next session to want the lock decided the holder had died and took it. The mutex below was defeated
+on every render. Driven at ten concurrent sessions spending $50 at a $5 threshold, the shipped 2.6.0
+under a BSD userland rings **zero** times and strands $3 in the shared accumulator; trimming
+`now_s` to its leading number gives the ten rings and nothing carried.
+
+`readlink -f` only reached macOS in 12.3, and the fallback kept whatever `$0` was — which `setup`
+then writes into `settings.json`, and which `ROOT` (the price seed, the wav) is derived from. It is
+made absolute now.
+
 **`LC_ALL=C` at the top of the script is load-bearing.** Money and percentages are text all the way
 through. Under a comma-decimal locale `awk` and `printf` disagree about what `9.76` means and the
 arithmetic silently stops working. Found on a Ukrainian-locale shell.
@@ -78,18 +101,30 @@ such record at all, and it undercounts cache-write by 15%. Same-id records are a
 the file, so an incremental reader only ever has one straddling group to think about.
 
 **Claude's `total_cost_usd` already contains subagent spend.** Do not add a derived figure to it.
-Measured on 2.1.227/2.1.228 by pricing transcripts with the models.dev rates: on eight sessions that
-spawned subagents, the parent transcript alone accounts for 73–94% of the host's number, and adding
-the child transcripts under `<session>/subagents/` closes it to 98.7–100.0%. The method is calibrated
-— on three sessions with no subagents it reproduces `total_cost_usd` to within 0.05%. The upstream
-issues that say child sessions never roll up
-([claude-code#48040](https://github.com/anthropics/claude-code/issues/48040),
+The CLI keeps the session's cost in one process-global counter — `mn.totalCostUSD` in 2.1.228, where
+`mn` is a plain module singleton, not anything scoped per agent — and exactly one function adds to
+it, reached from one place: the accounting that runs when an API response completes. So there is no
+per-agent partition for a rollup to miss. Every request the process makes credits the same number,
+whatever spawned it and however deep.
+
+Measured to agree on a live session carrying a three-deep `Task` chain and two `workflow-subagent`
+agents: the parent transcript alone reaches 93.9% of the host's figure, and adding the five child
+transcripts closes it to 99.996%. Earlier, on eight sessions of `Explore`, `general-purpose` and
+custom agents at depth 1, priced from models.dev instead: 73–94% and 98.7–100.0%, calibrated against
+three subagent-free sessions to within 0.05%. The upstream issues that say child sessions never roll
+up ([claude-code#48040](https://github.com/anthropics/claude-code/issues/48040),
 [#60591](https://github.com/anthropics/claude-code/issues/60591)) no longer describe the shipping
-CLI. If you are ever tempted to build the rollup, re-run the check first — and note that the only
-place a cost figure exists is the statusline payload, so the check needs a *live* session with rtc
-running: its state file holds the host's number, and the transcripts hold the tokens. Nothing on
-disk records cost otherwise (`history.jsonl` is prompt text, `stats-cache.json` is aggregate
-token counts, and no transcript record carries a cost field).
+CLI.
+
+To re-run that check, price the transcripts with the table the CLI compiles in
+(`inputTokens:5, outputTokens:25, promptCacheWriteTokens:6.25, promptCacheWrite1hTokens:10,
+promptCacheReadTokens:0.5`) rather than with models.dev — reproducing the host's own arithmetic is
+the one job that table is right for, and then a shortfall means a transcript nobody read rather than
+a rate that moved. That is the opposite of what the rule above forbids, which is showing a user a
+compiled price. The only place a cost figure exists is the statusline payload, so the check needs a
+*live* session with rtc running: its state file holds the host's number and the transcripts hold the
+tokens. Nothing on disk records cost otherwise (`history.jsonl` is prompt text, `stats-cache.json`
+is aggregate token counts, and no transcript record carries a cost field).
 
 Every child transcript lives under the parent session's directory, and there are exactly four path
 shapes in `~/.claude/projects/<slug>/`:
@@ -107,18 +142,20 @@ session's id in their `sessionId` — a child transcript never names itself ther
 do nest**, one level deeper under `subagents/workflows/<wf>/`, so a flat `subagents/*.jsonl` glob
 misses them; the complete sweep is `subagents` recursively for `agent-*.jsonl`.
 
-What the measurement actually covered: `Explore`, `general-purpose` and custom (`research-*`) agent
-types, all at depth 1. Not covered by direct measurement, because no session on the machine had both
-one of these and a surviving rtc state file to read the host's number from: depth 2 and 3 agents,
-`workflow-subagent`, and `fork`. They are the same Task machinery writing to the same place under the
-same session id, so the same arithmetic should hold — but that is an argument, not a measurement, and
-it is the thing to check first if the totals ever look light on a delegation-heavy session.
+Agent forms covered by measurement: `Explore`, `general-purpose` and custom (`research-*`) types at
+depth 1, `Task` at depths 2 and 3, and `workflow-subagent`. `fork` has not been run against the
+host's number, and needs no separate check unless the counter above stops being one counter — it
+issues its requests from the same process as everything else.
 
-Genuinely outside all of this, on both platforms: anything that is a *separate session* rather than a
-child of this one — a `claude -p` run started from a hook or a Bash call, another local session
-reached over SendMessage, a cloud or remote-isolation agent. Their spend is billed to their own
-session, and a headless one has no statusline for rtc to sit in, so nothing sees it. That is a
-property of where rtc lives, not a bug in the accounting.
+A remote workflow agent is **not** outside the accounting, which this file used to claim. When a
+`workflow_remote_agent` cloud session finishes, the CLI walks its per-model usage and hands each
+entry to the same function that credits an ordinary response, so the spend arrives in
+`total_cost_usd` on the parent — late, in one lump, at the moment the agent returns.
+
+Genuinely outside it, on both platforms: anything that is a *separate session* rather than a child of
+this one — a `claude -p` run started from a hook or a Bash call, another local session reached over
+SendMessage. Their spend is billed to their own session, and a headless one has no statusline for rtc
+to sit in, so nothing sees it. That is a property of where rtc lives, not a bug in the accounting.
 
 **The version must bump for an update to reach an install.** Refreshing a marketplace does not
 re-fetch a plugin whose version has not moved. A fix left at the same version sits unreachable; this
@@ -142,14 +179,24 @@ kimi/commands/setup.md       /realtokencost:setup (Kimi — command bodies are p
 share/cash-register.wav      CC0, see share/ATTRIBUTION.md
 share/prices.tsv             bundled Kimi price seed — last precedence, dated, see the
                              price rule under "constraints" before touching it
+drive/matrix.sh              every drive on every supported platform — see "Testing"
+drive/lib.sh                 the scratch world each drive runs in, and the second
+                             arithmetic their expected figures come from
 .claude-plugin/plugin.json   plugin manifest
 .claude-plugin/marketplace.json   single-plugin marketplace, source "./"
 ```
 
 `rtc statusline` is what the status line command runs (`statusLine.command` on Claude,
 `[status_line].command` on Kimi). `rtc hook`, `halt`, `setup`, `uninstall`, `rates`, `doctor` are
-the rest. `rates` fetches what models.dev publishes for the models in Kimi's `config.toml` into
-`$XDG_CACHE_HOME/realtokencost/price-<model>` — the Kimi money source alongside `RTC_PRICE_*`.
+the rest. `rates` fetches what models.dev publishes into
+`$XDG_CACHE_HOME/realtokencost/price-<model>` — the Kimi money source alongside `RTC_PRICE_*`. It
+takes its roster from two places, and needs both: the `[models.*]` tables in Kimi's `config.toml`,
+and every alias a live wire has actually reported, read off the `.wire` and `.subs` sidecars.
+Nothing configures the model a subagent runs, so an alias that arrives only on that agent's own
+`usage.record` rows has no table to be found in, and before this it could never get a price file at
+all — its spend went missing from a session whose own model looked fine. A wire-discovered alias has
+no model id to pair with either, so its last path segment stands in: `kimi-code/k3` asks models.dev
+for `k3`, and the lookup already tries the `kimi-` prefix beside it.
 `doctor` exists to answer "why is it quiet" without a debugging session —
 extend it when you add a way for things to be quiet. Every ring mode is one such way, and so is a
 shared ring, which is why each prints its own line there. A Kimi model with no rate is another —
@@ -241,8 +288,22 @@ starts and ends on its own schedule. Three things are worth knowing before chang
   the very first render — when `last` is empty and main is adopting too — do the siblings adopt their
   current size. Getting this backwards loses the first subagent of every session.
 - **Rows are priced by the model each row names**, not by the session's model. A subagent may run
-  something the main agent never touches, which is also why a subagent model with no rate is its own
-  doctor line: the total goes quietly short while the session's own model looks fine.
+  something the main agent never touches — a Kimi task carries its own `model` beside its
+  `subagent_type`, and an agent profile sets one with `model_preference` — which is also why a
+  subagent model with no rate is its own doctor line: the total goes quietly short while the
+  session's own model looks fine. A wire that names a model with no rate also asks for a fetch, on
+  the same terms the main model gets and under the same six-hour throttle, so the gap closes itself
+  on the next render instead of waiting for someone to read doctor.
+
+  A mixed session has still never been seen here, and the reason is worth knowing before hunting for
+  one: a Kimi subagent inherits the session's model. Driven live with `-m` both ways, main and
+  `agent-0` came out matching each time, and 12,453 of the 12,552 `usage.record` rows on this machine
+  name `kimi-code/k3` with the other 99 on main wires of sessions that ran `kimi-for-coding` whole.
+  An agent profile with `model_preference` did not change it — the CLI answered that the profile
+  "isn't available" and fell back to the generic `agent`, which is a discovery question nobody has
+  chased. So the per-row path is verified on real rows carrying both real aliases rather than on a
+  live mixed session, and the thing that keeps it honest is that a task carries its own `model`, so
+  the day one arrives, nothing needs to change to count it.
 - **Subagent money never reaches the estimate.** It moves `cost`, so the ring and the floating number
   see it, but `record_sample` and `last_call` are driven by the main agent's share alone (`mainbump`,
   which the money `awk` returns beside the total bump). A subagent request re-reads its own context,
@@ -330,6 +391,11 @@ which is the steady state):
 | Kimi, 16 subagent wires | 15.3ms | 18.9ms |
 | Claude | unchanged | unchanged |
 
+The macOS fixes cost nothing on top of that: 12.6ms against 12.2ms with no subagents, 18.1ms against
+18.5ms with four wires, over 40 idle renders each, which is noise. `now_s` still forks `date` once
+and only once, because it trims what BSD hands back rather than probing with a second call, and the
+`setsid` question is answered by a builtin.
+
 A session with no subagents pays nothing measurable, because the probe that decides whether to go on
 is a glob and a `[ -f ]` — builtins, no process. Past that the cost is one `stat` covering every wire
 at once rather than one each, which is why 16 wires cost roughly what 4 do plus change. `jq` runs
@@ -365,6 +431,18 @@ Write the `2>/dev/null` **before** the target, not after — redirections are se
 one written last arrives too late to swallow the `cannot overwrite existing file` the failing one
 prints.
 
+**The acquisition time is written in the same syscall, but not in the same instant.** The open comes
+first, so between the two a contender can read a lock file that exists and says nothing yet. Reading
+that empty stamp as zero — unset, therefore ancient, therefore dead — let the contender take the
+lock from a holder a microsecond old, and the second write through the section overwrote the first.
+It surfaces as a ring that never sounds and a few dollars the ear never counts — three runs in eight
+of the ten-way drive under bash 3.2 in a container, none in eight after the fix, and rare enough on
+a fast native shell to look like a fluke when it does happen. So an unreadable stamp means "wait",
+and only a stamp still unreadable after the whole spin means "corpse". Anything that
+reads a timestamp out of a file this way needs the same distinction; the numeric guards elsewhere in
+this script default to zero on purpose and are safe because zero there means "not yet", not "long
+ago".
+
 **The lock is taken on a bump, never on an idle render.** A shared file read every second by every
 session and locked every second by every session would be exactly the cost this project spends its
 time avoiding. The gate is: money just arrived, or this session is still carrying money it failed to
@@ -388,8 +466,43 @@ strike is in the first 50ms, so without the lead-in you hear the tail ring alone
 
 ## Testing
 
-There is no test suite. Drive the script with synthetic payloads on stdin — everything it needs is in
-the JSON:
+`drive/matrix.sh` — every drive, on every platform this project claims. It is not a unit-test suite
+and should not become one: each drive builds a whole scratch world, runs the real script against it
+with real payloads on stdin, and checks what came out the other end. Nothing in `drive/` shares code
+with `bin/rtc`; the figures the drives expect are computed a second time, from the rows, by a
+different `awk`. The drives are here because the ones written for 2.6.0 lived in a session
+scratchpad and were gone by the next session, and the version after that spent its first hour
+rebuilding them from this file.
+
+```
+drive-kimi        the main wire and the subagent wires: adopt, price, partial lines, rotation,
+                  per-model rates, and the sample the estimate is taught
+drive-claude      the Claude side — the once-per-turn TTL read, the band hook, the halt
+                  marker, doctor, and a setup/uninstall round trip
+drive-ring        the cooldown, the lock, and the detached refresh
+drive-rates       `rates` against a canned models.dev, including a subagent model that
+                  config.toml has never heard of
+drive-concurrent  ten sessions on one shared ring, and a subagent writing its wire while
+                  renders land on it
+drive-real        a real session off this machine, replayed from byte 0, then again with a
+                  second real model on one of its subagents
+```
+
+The three platforms it runs them on are `native`, the macOS-shaped `PATH` from `drive/mkshim.sh`,
+and bash 3.2.57 in a container — see the macOS constraint above for why both simulated halves are
+worth the trouble. `drive/bench.sh` times idle renders, which is the number the performance section
+below is about.
+
+Two things the drives cannot reach, so they were driven by hand and are worth repeating by hand
+after any change to the wire tailer. Watching a live Kimi session: `kimi -p '…'` in a scratch
+directory with a one-second render loop pointed at the session it creates (`-p` refuses to combine
+with `-y` or `--auto`; it needs neither). The wire of a subagent spawned mid-session appears between
+two renders and is counted from byte 0, which is the rule that is easiest to get backwards.
+And measuring Claude's rollup, which needs a live session with rtc in its statusline — see the
+`total_cost_usd` constraint for the method.
+
+Everything the drives do can also be done by hand. Synthetic payloads on stdin are all the script
+needs — everything is in the JSON:
 
 ```bash
 printf '{"session_id":"t","model":{"display_name":"Opus 5","id":"claude-opus-5"},"prompt_id":"p1",
@@ -416,35 +529,31 @@ printf '%s\n' '{"type":"usage.record","model":"kimi-code/k3","usage":{"inputOthe
   >> "$K/sessions/proj/session_t/agents/main/wire.jsonl"   # then render again — a bump lands
 ```
 
-The first render must adopt the wire's size and announce nothing; a render with no appended rows must
-add nothing; a row with `inputCacheCreation > inputCacheRead` must land in `.rebuilds`, not `.turns`.
-With no price at all the money display must vanish whole — gauge only — and reappear when one is set.
+Subagents are the same drive with `agents/agent-N/wire.jsonl` beside `agents/main/`. Every assertion
+worth making about either kind of wire is in `drive-kimi` and `drive-real`, each one there because it
+broke something on the way in — and the one to look at first if the estimate ever starts drifting is
+that the `.turns` sample equals the **main** bump rather than the total, which is what catches
+subagent money being fed to a figure that must not see it.
 
-Subagents are the same drive with `agents/agent-N/wire.jsonl` beside `agents/main/`. What is worth
-asserting, because each of these broke something on the way in: a wire created after the first render
-counts from byte 0 while one present at the first render is adopted; two wires with different models
-in `RTC_PRICE_*` are each priced by their own; a partial trailing line is skipped and then counted
-once the newline lands; a wire replaced by a shorter file adopts instead of recounting; and the
-`.turns` sample equals the **main** bump, not the total — with subagent money mixed in, that is the
-assertion that catches the estimate being taught the wrong number.
-
-Worth checking against real data rather than synthetic: copy a live session's directory into a
-scratch `KIMI_CODE_HOME`, render once to adopt, rewind every offset in `.subs` and `woffset` in the
-state file to 0, render again, and compare the total against a `jq` sum over every `usage.record` row
-in every wire. On a 677-row four-subagent session that agrees to the tenth of a mill.
-
+Real data beats synthetic, and `drive-real` finds its own: the session on this machine with the most
+subagent wires, replayed from byte 0, against a `jq` sum over every row in every wire. On the 677-row
+four-subagent session it picks here, $66.839405 both ways, $3.612000 of it the subagents'. Then it
+takes a real wire from a session that ran a different model, drops it in as a subagent, and checks
+that each row is priced by the model it names — real rows and real aliases in a topology no session
+here has produced on its own, which is as close as a replay gets to the thing itself.
 
 Time-dependent behaviour — fade, cache expiry — is tested by rewriting the timestamp in the state
 file rather than sleeping. Rewrite it with `printf "%.6f"`; `awk`'s default output format turns an
 epoch into `1.78648e+09` and the test silently stops meaning anything.
 
 Cross-session behaviour cannot be tested that way, because the point of it is what several processes
-do to one file at the same moment. Drive a dozen `session_id`s at once with `&` and `wait`, and count
-rings by putting a fake `pw-play` first on `PATH` that appends a timestamp to a file — that exercises
-the real `play_sound`. The two assertions worth writing: `$50` spent across ten concurrent sessions
-at `RTC_THRESHOLD=5` gives exactly ten rings with nothing left carried, and no two ring timestamps
-under `immediate` are closer together than `RTC_COOLDOWN`. Both failed on the first implementation.
-Give the sessions an idle render or two at the end before counting, since a ring that landed on the
+do to one file at the same moment — `drive-concurrent` drives ten `session_id`s at once with `&` and
+`wait`. Rings are counted by putting a player that records instead of playing first on `PATH`, named
+after whichever one this platform would really have reached, so `play_sound` takes the branch it
+takes in earnest; `lib.sh` builds it. `$50` across ten concurrent sessions at `RTC_THRESHOLD=5` must
+give exactly ten rings with nothing carried anywhere afterwards — that assertion failed on the first
+implementation of the shared ring, and failed again under a BSD userland for an unrelated reason.
+Give the sessions an idle render or two before counting: a ring that lands on the
 same instant as the last bump is delivered on the render after it.
 
 ## Releasing
