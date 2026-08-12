@@ -112,13 +112,25 @@ half a money figure is worse than none, and doctor prints the exact line that fi
 directly — it is spent by the agents you sent out. Claude Code bills that to the session it came
 from, so the figure rtc shows there always covered it. Kimi Code gives each subagent its own wire and
 the main one carries none of those rows, so rtc tails the siblings too, one saved offset each, and
-prices every row by the model that row names — a subagent need not run the model you are talking to.
-On one four-subagent session that was $3.61 of $66.84 nobody was looking at. It joins the same total:
-one number, one ring, one estimate. `rtc doctor` says how much of a session's total came from
-subagents, and names any subagent model it has no rate for.
+prices every row by the model that row names rather than by the session's. On one four-subagent
+session that was $3.61 of $66.84 nobody was looking at. It joins the same total and rings the same
+bell — and stays out of the estimate on purpose, because the estimate answers what submitting *your*
+context costs and a subagent re-reads its own. `rtc doctor` says how much of a session's total came
+from subagents, and names any subagent model it has no rate for.
 
-One honest gap: Kimi publishes no prompt-cache TTL, so on Kimi the estimate shows the warm figure
-without the amber/red expiry countdown. The dollars stay measured; only the clock is missing.
+What it cannot see is a *separate session*. A subagent belongs to the session that sent it, at any
+depth, and is counted; a `claude -p` run started from a hook or a Bash call gets a session of its
+own, and its spend is billed and shown there rather than here. Same for another local session you
+reach over SendMessage. It is the same fact from both sides — the cost of a session is a number kept
+by the process running it, so everything inside that process lands in it and nothing outside can. A
+cloud agent launched from a workflow is the exception that proves it: Claude Code folds its usage
+back in when it returns, so that one does count.
+
+Two honest gaps. Kimi publishes no prompt-cache TTL, so on Kimi the estimate shows the warm figure
+without the amber/red expiry countdown — the dollars stay measured, only the clock is missing. And
+Kimi subagents inherit the model you are talking to, so while every row is priced by the model that
+row names, a session mixing two of them is a case that has been built and checked rather than seen
+in the wild.
 
 OpenCode is not supported yet: it has no statusline-command integration point
 ([opencode#30295](https://github.com/anomalyco/opencode/issues/30295)). When one lands, rtc's
@@ -335,6 +347,12 @@ Reports from a real one are still welcome.
 [AGENTS.md](AGENTS.md) is the starting point — the constraints that shape the design, what the runtime
 state looks like, how to drive the script without a live session, and a list of things deliberately
 not done so they do not get helpfully re-added.
+
+`./drive/matrix.sh` runs the whole suite on every platform this supports, which takes about ninety
+seconds and includes macOS in the only two forms available off a Mac: a BSD-shaped `PATH` with no
+`setsid` and no `tac`, and bash 3.2.57 in a container. Run it before opening a pull request.
+`./drive/mutate.sh` breaks one line of `bin/rtc` at a time and checks the suite notices — if you add
+a rule, add a mutant for it.
 
 ## Credits
 
