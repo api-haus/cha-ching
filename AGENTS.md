@@ -85,8 +85,40 @@ the child transcripts under `<session>/subagents/` closes it to 98.7–100.0%. T
 issues that say child sessions never roll up
 ([claude-code#48040](https://github.com/anthropics/claude-code/issues/48040),
 [#60591](https://github.com/anthropics/claude-code/issues/60591)) no longer describe the shipping
-CLI. If you are ever tempted to build the rollup, re-run the check first: `bin/rtc` state files hold
-the host's number per live session, and the transcripts hold the tokens.
+CLI. If you are ever tempted to build the rollup, re-run the check first — and note that the only
+place a cost figure exists is the statusline payload, so the check needs a *live* session with rtc
+running: its state file holds the host's number, and the transcripts hold the tokens. Nothing on
+disk records cost otherwise (`history.jsonl` is prompt text, `stats-cache.json` is aggregate
+token counts, and no transcript record carries a cost field).
+
+Every child transcript lives under the parent session's directory, and there are exactly four path
+shapes in `~/.claude/projects/<slug>/`:
+
+```
+<session>.jsonl                                the parent
+<session>/subagents/agent-<id>.jsonl           Task subagents — every depth, every agent type
+<session>/subagents/workflows/<wf>/agent-<id>.jsonl   Workflow tool agents
+<session>/subagents/workflows/<wf>/journal.jsonl      the workflow journal, no usage in it
+```
+
+Two traps in that. **Nesting does not nest**: an agent that spawns an agent that spawns an agent
+gives `spawnDepth` 1, 2 and 3 side by side in one flat `subagents/`, all carrying the *root*
+session's id in their `sessionId` — a child transcript never names itself there. **Workflow agents
+do nest**, one level deeper under `subagents/workflows/<wf>/`, so a flat `subagents/*.jsonl` glob
+misses them; the complete sweep is `subagents` recursively for `agent-*.jsonl`.
+
+What the measurement actually covered: `Explore`, `general-purpose` and custom (`research-*`) agent
+types, all at depth 1. Not covered by direct measurement, because no session on the machine had both
+one of these and a surviving rtc state file to read the host's number from: depth 2 and 3 agents,
+`workflow-subagent`, and `fork`. They are the same Task machinery writing to the same place under the
+same session id, so the same arithmetic should hold — but that is an argument, not a measurement, and
+it is the thing to check first if the totals ever look light on a delegation-heavy session.
+
+Genuinely outside all of this, on both platforms: anything that is a *separate session* rather than a
+child of this one — a `claude -p` run started from a hook or a Bash call, another local session
+reached over SendMessage, a cloud or remote-isolation agent. Their spend is billed to their own
+session, and a headless one has no statusline for rtc to sit in, so nothing sees it. That is a
+property of where rtc lives, not a bug in the accounting.
 
 **The version must bump for an update to reach an install.** Refreshing a marketplace does not
 re-fetch a plugin whose version has not moved. A fix left at the same version sits unreachable; this
