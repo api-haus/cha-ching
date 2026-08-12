@@ -23,11 +23,14 @@ near 'an appended row is priced and lands' 0.028176 "$(cost)"
 render >/dev/null
 near 'a render with no new rows adds nothing' 0.028176 "$(cost)"
 
-n0=$(wc -l < "$XDG_RUNTIME_DIR/rtc-kimi-$SESS.rebuilds" 2>/dev/null || echo 0)
+n0=$(lines "$XDG_RUNTIME_DIR/rtc-kimi-$SESS.rebuilds")
+t0=$(lines "$XDG_RUNTIME_DIR/rtc-kimi-$SESS.turns")
 row "$M" 100 1000 90000 200
 render >/dev/null
-n1=$(wc -l < "$XDG_RUNTIME_DIR/rtc-kimi-$SESS.rebuilds" 2>/dev/null || echo 0)
-is 'a cache-rebuild row files under .rebuilds' "$((n0 + 1))" "$((n1))"
+is 'a cache-rebuild row files under .rebuilds' "$((n0 + 1))" \
+  "$(($(lines "$XDG_RUNTIME_DIR/rtc-kimi-$SESS.rebuilds")))"
+is '  and not under .turns, which measures a rate rather than an event' "$t0" \
+  "$(lines "$XDG_RUNTIME_DIR/rtc-kimi-$SESS.turns")"
 
 printf '\n== no rate at all ==\n'
 fresh noprice

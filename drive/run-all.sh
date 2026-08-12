@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Every drive, on one platform. Called by the matrix runner below with a name
-# and an already-arranged environment.
+# Every drive, on one platform. matrix.sh calls this once per platform with a
+# name and an environment it has already arranged; run it directly to drive
+# whatever platform you are standing on.
 set -u
 cd "$(dirname "$0")"
 name=${1:?platform name}

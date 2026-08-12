@@ -42,12 +42,14 @@ msg=$(printf '{"session_id":"%s"}' "$CSESS" | "$RTC" hook)
 is 'and says it once' '' "$msg"
 
 printf '\n== the halt marker ==\n'
-RTC_RING=on_halt printf '{"session_id":"%s"}' "$CSESS" >/dev/null
+HALT="$XDG_RUNTIME_DIR/rtc-$CSESS.halt"
 printf '{"session_id":"%s"}' "$CSESS" | RTC_RING=on_halt "$RTC" halt
-if [ -e "$XDG_RUNTIME_DIR/rtc-$CSESS.halt" ]; then ok 'Stop leaves a marker for the next render'
+if [ -e "$HALT" ]; then ok 'Stop leaves a marker for the next render'
 else bad 'Stop leaves a marker for the next render' 'marker' 'none'; fi
-printf '{"session_id":"%s"}' "$CSESS" | "$RTC" halt
-is 'and writes nothing at all in the other modes' 1 1
+rm -f "$HALT"
+printf '{"session_id":"%s"}' "$CSESS" | RTC_RING=immediate "$RTC" halt
+if [ -e "$HALT" ]; then bad 'and leaves nothing behind in the other modes' 'no marker' 'a marker'
+else ok 'and leaves nothing behind in the other modes'; fi
 
 printf '\n== doctor ==\n'
 # doctor reports on what it finds wired, so give it a settings.json

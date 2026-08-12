@@ -9,7 +9,7 @@ export RTC_MUTE=0
 
 
 printf '\n== now_s under this platform ==\n'
-t=$("$RTC" doctor >/dev/null 2>&1; date +%s.%N)
+t=$(date +%s.%N)
 printf '  date +%%s.%%N -> %s\n' "$t"
 case "$t" in *[!0-9.]*) printf '  (not a number — every clock in the script reads this)\n' ;; esac
 

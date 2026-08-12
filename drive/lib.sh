@@ -53,9 +53,14 @@ row() {                         # row <wire> <io> <cread> <cwrite> <out> [model]
 field() { cut -d' ' -f"$2" < "$XDG_RUNTIME_DIR/rtc-kimi-$SESS.state" 2>/dev/null; }
 cost()  { field 1 1; }
 sacc()  { field 1 13; }
+# A file that does not exist yet has no lines. Ask before reading rather than
+# after: a failed input redirect is reported by the shell, and a 2>/dev/null on
+# the same command is set up too late to catch it — the trap the ring lock
+# documents, in the other direction.
+lines() { if [ -r "$1" ]; then wc -l < "$1" | tr -d ' '; else printf 0; fi; }
 # The player is detached on purpose, so a wedged audio server never stalls a
 # render. Give it a beat to land before counting.
-rings() { sleep 0.4; wc -l < "$RTC_RING_LOG" 2>/dev/null | tr -d ' '; }
+rings() { sleep 0.4; lines "$RTC_RING_LOG"; }
 
 # Price every usage.record row in every wire under a session directory, from
 # the rows themselves. This is the figure rtc's running total is compared

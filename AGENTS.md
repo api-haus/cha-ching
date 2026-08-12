@@ -559,6 +559,7 @@ same instant as the last bump is delivered on the render after it.
 ## Releasing
 
 ```bash
+./drive/matrix.sh            # all three platforms, ~90s — a Mac cannot be checked after the fact
 # bump ALL THREE manifests — they are checked independently
 sed -i 's/"version": "X"/"version": "Y"/' .claude-plugin/plugin.json .claude-plugin/marketplace.json kimi.plugin.json
 git commit && git push
