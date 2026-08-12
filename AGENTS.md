@@ -61,10 +61,32 @@ through. Under a comma-decimal locale `awk` and `printf` disagree about what `9.
 arithmetic silently stops working. Found on a Ukrainian-locale shell.
 
 **One API response writes several transcript records.** Text, thinking and each `tool_use` block get
-their own record, and every one carries the same `usage` object. Any transcript analysis must
-`group_by(.message.id)` first. Summing records inflated a measurement by roughly half before this was
-caught. Kimi's wire is the opposite discipline: only `usage.record` rows count, and the same usage
-also appears inside `context.append_loop_event` `step.end` events — summing those would double it.
+their own record. Any transcript analysis must `group_by(.message.id)` first. Summing records
+inflated a measurement by roughly half before this was caught. Kimi's wire is the opposite
+discipline: only `usage.record` rows count, and the same usage also appears inside
+`context.append_loop_event` `step.end` events — summing those would double it.
+
+**Grouping is not enough: the reducer must be `max`.** Those records do *not* all carry the same
+`usage` object, which this file claimed until it was measured. They are streamed snapshots.
+`input_tokens`, `cache_read_input_tokens` and `cache_creation_input_tokens` are constant within a
+`message.id`, but `output_tokens` **grows**, and the last record holds the final figure. On one
+120-response transcript: summing every record gives 50626 output tokens, `max` (equivalently `last`)
+per id gives the true 50264, and `first` per id gives **9014** — a 5.6× undercount from the reducer
+alone. Verified across a dozen transcripts and two models. The tempting shortcut — count only the
+records whose usage carries an `iterations` array — is wrong too: 30 of those 120 responses have no
+such record at all, and it undercounts cache-write by 15%. Same-id records are always contiguous in
+the file, so an incremental reader only ever has one straddling group to think about.
+
+**Claude's `total_cost_usd` already contains subagent spend.** Do not add a derived figure to it.
+Measured on 2.1.227/2.1.228 by pricing transcripts with the models.dev rates: on eight sessions that
+spawned subagents, the parent transcript alone accounts for 73–94% of the host's number, and adding
+the child transcripts under `<session>/subagents/` closes it to 98.7–100.0%. The method is calibrated
+— on three sessions with no subagents it reproduces `total_cost_usd` to within 0.05%. The upstream
+issues that say child sessions never roll up
+([claude-code#48040](https://github.com/anthropics/claude-code/issues/48040),
+[#60591](https://github.com/anthropics/claude-code/issues/60591)) no longer describe the shipping
+CLI. If you are ever tempted to build the rollup, re-run the check first: `bin/rtc` state files hold
+the host's number per live session, and the transcripts hold the tokens.
 
 **The version must bump for an update to reach an install.** Refreshing a marketplace does not
 re-fetch a plugin whose version has not moved. A fix left at the same version sits unreachable; this
@@ -124,11 +146,12 @@ sessions use the same files with an `rtc-kimi-` prefix instead of `rtc-`:
 | `rtc-<id>.halt` | the turn handed back; consumed by the next render |
 | `rtc-<id>.nudged` | set once when told to run setup |
 | `rtc-kimi-<id>.wire` | Kimi only: wire.jsonl path on line 1, model alias on line 2 |
+| `rtc-kimi-<id>.subs` | Kimi only: one line per subagent wire — `agent-N offset alias` |
 
 State field order, positional, read with one `read`:
 
 ```
-cost pending ring_ts shown shown_ts prev_prompt turn_cost turn_ctx last_call ttl ring_acc woffset
+cost pending ring_ts shown shown_ts prev_prompt turn_cost turn_ctx last_call ttl ring_acc woffset sacc
 ```
 
 `woffset` is the Kimi wire.jsonl byte offset; 0 on Claude. On Kimi `cost` is not host-reported —
@@ -137,11 +160,10 @@ wire adopts its current size as the offset rather than announcing history (the s
 cost sighting). The wire path lives in a side file, not the state file, because paths can contain
 characters the positional format cannot.
 
-State field order, positional, read with one `read`:
-
-```
-cost pending ring_ts shown shown_ts prev_prompt turn_cost turn_ctx last_call ttl ring_acc
-```
+`sacc` is how much of `cost` came from subagents. It is what doctor reports and it is never
+subtracted from anything — subagent money is the session's money. The sibling offsets are not in
+here either, for the same reason as the wire path plus one more: there is one per wire and the
+format is a single line.
 
 Adding a field means appending and widening the `read` — never reordering, and never widening one
 without the other: `read` puts everything it has no variable left for into the last one, so a write
@@ -161,6 +183,43 @@ inside exactly like a broken ring. In this scope `ring_acc` in the session file 
 narrower: money this session accepted but has not handed over yet, non-zero only between losing the
 lock and winning it back.
 
+## Subagent spend
+
+Both platforms count it. They arrive there differently, and the difference is the whole story.
+
+**Claude counts it for free.** `cost.total_cost_usd` already includes what the children spent, so rtc
+adds nothing and reads no child transcript. The constraint above has the measurement; doctor prints
+one line saying so, because "are my subagents counted" is the obvious question and a silent yes reads
+the same as a no.
+
+**Kimi has to be told.** Every subagent gets its own
+`$KIMI_CODE_HOME/sessions/<proj>/session_<id>/agents/agent-<N>/wire.jsonl`, carrying the same
+`usage.record` rows the main tailer already prices, and the main wire carries none of them: on a live
+four-subagent session, 581 rows in `agents/main` against 96 across the siblings, with not one `time`
+key shared between them. Since the Kimi total is a figure rtc computes rather than one it harvests,
+that money was simply absent. On that session it was $3.61 of $66.84 — 5.4%.
+
+So `kimi_subagents` tails the siblings the way `kimi_main_delta` tails main, with the same four
+rules: adopt on first sight, never recount history, leave a partial last line for the next render,
+and treat `size < offset` as a rotation and adopt again. Each wire keeps its own offset, because each
+starts and ends on its own schedule. Three things are worth knowing before changing it:
+
+- **A wire that appears after the session's first render is not history.** It is a subagent that has
+  just been spawned, and every byte of it belongs to this session, so it starts at offset 0. Only on
+  the very first render — when `last` is empty and main is adopting too — do the siblings adopt their
+  current size. Getting this backwards loses the first subagent of every session.
+- **Rows are priced by the model each row names**, not by the session's model. A subagent may run
+  something the main agent never touches, which is also why a subagent model with no rate is its own
+  doctor line: the total goes quietly short while the session's own model looks fine.
+- **Subagent money never reaches the estimate.** It moves `cost`, so the ring and the floating number
+  see it, but `record_sample` and `last_call` are driven by the main agent's share alone (`mainbump`,
+  which the money `awk` returns beside the total bump). A subagent request re-reads its own context,
+  not this one — feeding it in would inflate the dollars-per-million ratio the estimate is built from
+  and restart a cache clock that never stopped.
+
+The sidecar is keyed by directory name (`agent-0`), never by path: the path is rebuilt from main's,
+so no field can contain a space and the whole file parses with `read`.
+
 ## Things deliberately not done
 
 Do not "fix" these. Each was tried or considered and rejected for a reason.
@@ -171,13 +230,9 @@ user slot, and the request for one
 API is TypeScript with toasts, which would be a second codebase for half the features. When a
 statusline slot lands, the payload-detection branch in `cmd_statusline` is where it plugs in.
 
-**Subagent spend.** Not counted on either platform, and today that is parity, not a gap: Claude's
-`total_cost_usd` covers the parent session only — child sessions bill separately and never roll up
-([claude-code#60591](https://github.com/anthropics/claude-code/issues/60591)) — and the Kimi tailer
-reads only `agents/main/wire.jsonl` while `agents/agent-N/wire.jsonl` rows go uncounted. The data
-exists on both sides (child transcripts; sibling wires), so this is a queued feature, not an
-impossibility: Claude first (transcript rollup — mind the `group_by(.message.id)` rule, one API
-response writes several records), then Kimi (enumerate the sibling wires, one offset each).
+**A Claude-side subagent rollup.** Counting it would count it twice — see the `total_cost_usd`
+constraint above, which was measured rather than assumed. Claude sessions therefore run none of the
+subagent code at all, and the render path there is untouched.
 
 **Learning Kimi's cache TTL.** No payload or wire record names it, and the hint dialog in the TUI
 proves the CLI knows it but does not print it. It could be bounded empirically (a rebuild after an
@@ -232,6 +287,22 @@ the script. The minute counter in the key exists so a window cannot go cold behi
 still claims it is warm.
 
 Anything added to the render path is paid once per second per session. Weigh it accordingly.
+
+The Kimi subagent pass is priced the same way. Measured over 40 renders each, idle (nothing appended,
+which is the steady state):
+
+| session | before | after |
+|---|---|---|
+| Kimi, no subagents | 15.3ms | 16.0ms |
+| Kimi, 4 subagent wires | 15.5ms | 17.8ms |
+| Kimi, 16 subagent wires | 15.3ms | 18.9ms |
+| Claude | unchanged | unchanged |
+
+A session with no subagents pays nothing measurable, because the probe that decides whether to go on
+is a glob and a `[ -f ]` — builtins, no process. Past that the cost is one `stat` covering every wire
+at once rather than one each, which is why 16 wires cost roughly what 4 do plus change. `jq` runs
+only for a wire that actually grew, and the sidecar is rewritten only when an offset actually moved
+— an idle render reads it and puts nothing back.
 
 ## The sound
 
@@ -316,6 +387,19 @@ printf '%s\n' '{"type":"usage.record","model":"kimi-code/k3","usage":{"inputOthe
 The first render must adopt the wire's size and announce nothing; a render with no appended rows must
 add nothing; a row with `inputCacheCreation > inputCacheRead` must land in `.rebuilds`, not `.turns`.
 With no price at all the money display must vanish whole — gauge only — and reappear when one is set.
+
+Subagents are the same drive with `agents/agent-N/wire.jsonl` beside `agents/main/`. What is worth
+asserting, because each of these broke something on the way in: a wire created after the first render
+counts from byte 0 while one present at the first render is adopted; two wires with different models
+in `RTC_PRICE_*` are each priced by their own; a partial trailing line is skipped and then counted
+once the newline lands; a wire replaced by a shorter file adopts instead of recounting; and the
+`.turns` sample equals the **main** bump, not the total — with subagent money mixed in, that is the
+assertion that catches the estimate being taught the wrong number.
+
+Worth checking against real data rather than synthetic: copy a live session's directory into a
+scratch `KIMI_CODE_HOME`, render once to adopt, rewind every offset in `.subs` and `woffset` in the
+state file to 0, render again, and compare the total against a `jq` sum over every `usage.record` row
+in every wire. On a 677-row four-subagent session that agrees to the tenth of a mill.
 
 
 Time-dependent behaviour — fade, cache expiry — is tested by rewriting the timestamp in the state

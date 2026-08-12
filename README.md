@@ -107,6 +107,15 @@ shows which tier every model's number came from. A model with no rate anywhere �
 publishes no per-token price at all — gets the context gauge and warnings but no money display:
 half a money figure is worse than none, and doctor prints the exact line that fixes it.
 
+**Subagents are counted, on both.** Delegate a lot of work and most of the money stops being yours
+directly — it is spent by the agents you sent out. Claude Code bills that to the session it came
+from, so the figure rtc shows there always covered it. Kimi Code gives each subagent its own wire and
+the main one carries none of those rows, so rtc tails the siblings too, one saved offset each, and
+prices every row by the model that row names — a subagent need not run the model you are talking to.
+On one four-subagent session that was $3.61 of $66.84 nobody was looking at. It joins the same total:
+one number, one ring, one estimate. `rtc doctor` says how much of a session's total came from
+subagents, and names any subagent model it has no rate for.
+
 One honest gap: Kimi publishes no prompt-cache TTL, so on Kimi the estimate shows the warm figure
 without the amber/red expiry countdown. The dollars stay measured; only the clock is missing.
 

@@ -273,6 +273,137 @@ kimi_tail() {
       END { printf "%d %d %d %d %d %s", off + n, io, cr, cw, o, a }'
 }
 
+# Same discipline as kimi_tail — complete lines only, the offset never moves
+# past anything but a newline — but folded per model instead of into one sum. A
+# subagent need not run the model the main agent runs, and every row names its
+# own, so the rows are priced by row rather than by session.
+#
+# Prints the new offset on the first line, then one "alias io cread cwrite out"
+# line per model seen in the chunk.
+kimi_tail_models() {
+  local wire="$1" off="$2" chunk complete
+  chunk=$(tail -c +"$((off + 1))" -- "$wire" 2>/dev/null; printf x)
+  chunk=${chunk%x}
+  case "$chunk" in
+    "")      complete="" ;;
+    *$'\n')  complete=$chunk ;;
+    *$'\n'*) complete=${chunk%$'\n'*}$'\n' ;;
+    *)       complete="" ;;
+  esac
+  [ -n "$complete" ] || { printf '%s\n' "$off"; return; }
+  # LC_ALL=C is set at the top, so ${#complete} counts bytes, which is what an
+  # offset into the file has to be.
+  printf '%s\n' "$((off + ${#complete}))"
+  printf '%s' "$complete" | jq -Rr '
+      fromjson? // empty | select(.type == "usage.record") |
+      [ (.model // "?"), (.usage.inputOther // 0), (.usage.inputCacheRead // 0),
+        (.usage.inputCacheCreation // 0), (.usage.output // 0) ] | @tsv' 2>/dev/null |
+    awk -F'\t' '{ io[$1] += $2; cr[$1] += $3; cw[$1] += $4; o[$1] += $5 }
+                END { for (m in io) printf "%s %d %d %d %d\n", m, io[m], cr[m], cw[m], o[m] }'
+}
+
+# Every Kimi subagent gets its own wire beside the main one, and the main wire
+# does not carry its rows: checked on a live four-subagent session, 581
+# usage.record rows in main against 96 across the siblings, and not one `time`
+# key shared between them. So a delegation-heavy session spends most of its
+# money where nothing was looking.
+#
+# One offset per wire, because each starts, grows and ends on its own schedule.
+# They live in a .subs sidecar rather than the state file — that format is
+# positional and single-line, and there is one line per wire here. The sidecar
+# is keyed by the agent directory name (agent-0, agent-1), never by path: the
+# path is reconstructed from the main wire's, so no field can ever contain a
+# space and the whole file parses with `read`.
+#
+# Runs inside cmd_statusline. Edits cost, sacc and sbump.
+kimi_subagents() {
+  local agents="$1" adopt="$2" subf="$RUN/$tag-$session.subs"
+  local probe="" sizes="" terms="" size path name off alias t newoff m io cr cw o
+  local -a sn=() so=() sa=()
+  local i found new="" was=""
+
+  # Builtins only up to here: a session with no subagents — most of them — must
+  # not pay a process to find that out, on a path that runs once a second.
+  for probe in "$agents"/agent-*/wire.jsonl; do
+    [ -f "$probe" ] && break
+    probe=""
+  done
+  [ -n "$probe" ] || return 0
+
+  if [ -r "$subf" ]; then
+    while read -r name off alias; do
+      [ -n "$name" ] || continue
+      sn+=("$name"); so+=("$off"); sa+=("$alias")
+      was="$was$name $off $alias"$'\n'
+    done < "$subf"
+  fi
+
+  # One stat for every wire rather than one each: the fork is the cost here, not
+  # the syscall. Tested on the output rather than the status — GNU stat exits
+  # non-zero when any one file has gone (a wire rotating under us) while still
+  # printing good lines for the rest, and those lines are worth keeping.
+  sizes=$(stat -c '%s %n' "$agents"/agent-*/wire.jsonl 2>/dev/null)
+  [ -n "$sizes" ] || sizes=$(stat -f '%z %N' "$agents"/agent-*/wire.jsonl 2>/dev/null)
+  [ -n "$sizes" ] || return 0
+
+  while IFS=' ' read -r size path; do
+    case "${size:-}" in ''|*[!0-9]*) continue ;; esac
+    [ -n "$path" ] || continue
+    name=${path%/wire.jsonl}; name=${name##*/}
+
+    off=""; alias=""
+    i=0; found=0
+    while [ "$i" -lt "${#sn[@]}" ]; do
+      if [ "${sn[$i]}" = "$name" ]; then off=${so[$i]}; alias=${sa[$i]}; found=1; break; fi
+      i=$((i + 1))
+    done
+    case "${off:-}" in ''|*[!0-9]*) off=-1 ;; esac
+
+    if [ "$found" = 0 ]; then
+      # A wire rtc has not seen. On the session's first render that is history —
+      # adopt it, the same rule main follows. Later, it is a subagent that has
+      # just been spawned, and every byte of it belongs to this session.
+      if [ "$adopt" = 1 ]; then off=$size; else off=0; fi
+    elif [ "$size" -lt "$off" ]; then
+      off=$size          # rotated out from under us: adopt, never recount
+    fi
+
+    if [ "$size" -gt "$off" ]; then
+      t=$(kimi_tail_models "$path" "$off")
+      newoff=${t%%$'\n'*}
+      case "${newoff:-}" in ''|*[!0-9]*) newoff=$off ;; esac
+      case "$t" in
+        *$'\n'*)
+          while IFS=' ' read -r m io cr cw o; do
+            [ -n "${m:-}" ] || continue
+            # The wire remembers which model it last ran, so doctor can name the
+            # one that has no rate instead of reporting a quiet total.
+            alias=$m
+            price_for "${m//[^A-Za-z0-9._-]/_}" &&
+              terms="$terms$io $cr $cw $o $PRICE"$'\n'
+          done <<< "${t#*$'\n'}" ;;
+      esac
+      off=$newoff
+    fi
+    new="$new$name $off $alias"$'\n'
+  done <<< "$sizes"
+
+  # An idle render leaves every offset where it was, and this runs once a second
+  # for as long as the session is open. Write only when something moved.
+  if [ "$new" != "$was" ]; then
+    printf '%s' "$new" > "$subf.tmp" 2>/dev/null &&
+      mv -f "$subf.tmp" "$subf" 2>/dev/null || true
+  fi
+
+  [ -n "$terms" ] || return 0
+  # One awk for every model group on every wire, priced like an API bill.
+  sbump=$(printf '%s' "$terms" |
+    awk '{ d += ($1*$5 + $2*$6 + $3*$7 + $4*$8) / 1000000 } END { printf "%.6f", d }')
+  case "${sbump:-}" in ''|*[!0-9.]*) sbump=0; return 0 ;; esac
+  cost=$(awk -v c="$cost" -v s="$sbump" 'BEGIN { printf "%.6f", c + s }')
+  sacc=$(awk -v a="${sacc:-0}" -v s="$sbump" 'BEGIN { printf "%.6f", a + s }')
+}
+
 # Cost under Kimi is a running total this script maintains: tail the wire from
 # the offset in the state file, price the new rows, add them in. What the
 # session spent before rtc first saw its wire is adopted, never announced —
@@ -308,6 +439,18 @@ kimi_measure() {
   price=$PRICE
   rates_maybe_refresh "${modelid:-unknown}"
 
+  # The main wire and the sibling wires are measured apart, because every one of
+  # the main path's exits below — adopted, unchanged, unpriced — is a state a
+  # subagent can be spending money through.
+  kimi_main_delta
+  local adopt=0
+  [ -z "${last:-}" ] && adopt=1
+  kimi_subagents "${wire%/main/wire.jsonl}" "$adopt"
+}
+
+# The main wire's share of the render: how far it has grown since the last one,
+# and what those rows cost. Runs inside kimi_measure and edits its locals.
+kimi_main_delta() {
   wsize=$(stat -c %s "$wire" 2>/dev/null || stat -f %z "$wire" 2>/dev/null || printf '0')
   case "${wsize:-}" in ''|*[!0-9]*) noprice=1; return ;; esac
 
@@ -381,20 +524,27 @@ cmd_statusline() {
   [ -n "${model:-}" ] || exit 0
 
   local now state tag last pending ring_ts shown shown_ts prev_prompt turn_cost turn_ctx last_call ttl
-  local ring_acc woffset halt="" halted=0 pulse=0 ring=0 bump money carry=0 deferred=0
+  local ring_acc woffset sacc halt="" halted=0 pulse=0 ring=0 bump mainbump=0 money carry=0 deferred=0
   local gring="" gts=0 gacc=0 locked=0 rts noprice=0
+  # Dollars this render's subagents added. Needed after the accounting below:
+  # subagent money counts towards the total, the ring and the floating number,
+  # but never towards the estimate — a subagent's request does not re-read the
+  # main context, so it measures nothing about what submitting that context
+  # costs.
+  local sbump=0
   now=$(now_s)
   tag=rtc
   [ "$platform" = kimi ] && tag=rtc-kimi
   state="$RUN/$tag-${session:-nosession}.state"
 
   last=""; pending=0; ring_ts=0; shown=0; shown_ts=0; prev_prompt="-"; turn_cost=""; turn_ctx=0
-  last_call=0; ttl=0; ring_acc=0; woffset=0
-  [ -r "$state" ] && IFS=' ' read -r last pending ring_ts shown shown_ts prev_prompt turn_cost turn_ctx last_call ttl ring_acc woffset < "$state" 2>/dev/null
+  last_call=0; ttl=0; ring_acc=0; woffset=0; sacc=0
+  [ -r "$state" ] && IFS=' ' read -r last pending ring_ts shown shown_ts prev_prompt turn_cost turn_ctx last_call ttl ring_acc woffset sacc < "$state" 2>/dev/null
   # A state file written before the ring had modes stops at ttl, and read leaves
   # the field it never wrote empty rather than absent. Same for woffset, which
-  # only Kimi sessions use.
+  # only Kimi sessions use, and for sacc, which arrived with subagent spend.
   [ -n "${ring_acc:-}" ] || ring_acc=0
+  case "${sacc:-}" in ''|*[!0-9.]*) sacc=0 ;; esac
   # -1 is the unset sentinel: 0 is a valid wire offset (an empty wire adopts at
   # size 0, and the first row appended must still count), so "never seen" has
   # to be its own value.
@@ -485,9 +635,13 @@ cmd_statusline() {
 
     money=$(awk -v c="$cost" -v l="$last" -v p="${pending:-0}" -v a="${ring_acc:-0}" \
                 -v ga="$gacc" -v min="$MIN" -v cd="$COOLDOWN" -v thr="$THRESHOLD" -v mode="$RING" \
-                -v halted="$halted" -v now="$now" -v sts="${shown_ts:-0}" -v rts="$rts" '
+                -v halted="$halted" -v now="$now" -v sts="${shown_ts:-0}" -v rts="$rts" -v sb="$sbump" '
       BEGIN {
         d = c - l; if (d < 0) d = 0
+        # What the main agent spent, apart from what its subagents did. The eye
+        # and the ear are told about all of it; only the estimate is not, since
+        # a subagent request re-reads its own context, not this one.
+        mb = d - sb; if (mb < 0) mb = 0
         p += d; a += d
         acc = a + ga             # everything the ear has not announced, wherever it was held
         carry = 0
@@ -499,13 +653,15 @@ cmd_statusline() {
         if      (mode == "cumulative_threshold") { ring = (acc >= thr); if (ring) carry = acc % thr }
         else if (mode == "on_halt")                ring = (halted && acc >= min)
         else                                       ring = (acc >= min && now - rts >= cd)
-        printf "%.6f %.6f %.6f %d %d %.6f %.6f", d, p, acc, pulse, ring, carry, a
+        printf "%.6f %.6f %.6f %d %d %.6f %.6f %.6f", d, p, acc, pulse, ring, carry, a, mb
       }')
-    IFS=' ' read -r bump pending ring_acc pulse ring carry deferred <<< "$money"
+    IFS=' ' read -r bump pending ring_acc pulse ring carry deferred mainbump <<< "$money"
 
-    if [ "$bump" != "0.000000" ]; then
+    # A request the main agent made is what restarts the cache clock and what
+    # teaches the estimate. Subagent spend moves the total without either.
+    if [ "$mainbump" != "0.000000" ]; then
       last_call=$now
-      record_sample "$bump" "$used" "$cwrite" "$cread" "$tag-${session:-nosession}" "$ratefile"
+      record_sample "$mainbump" "$used" "$cwrite" "$cread" "$tag-${session:-nosession}" "$ratefile"
     fi
 
     if [ "$pulse" = 1 ]; then shown=$pending; shown_ts=$now; pending=0; fi
@@ -542,9 +698,9 @@ cmd_statusline() {
     [ -n "${transcript:-}" ] && ttl=$(detect_ttl "$transcript" || printf '%s' "${ttl:-0}")
   fi
 
-  printf '%s %s %s %s %s %s %s %s %s %s %s %s\n' "$cost" "$pending" "$ring_ts" "$shown" "$shown_ts" \
+  printf '%s %s %s %s %s %s %s %s %s %s %s %s %s\n' "$cost" "$pending" "$ring_ts" "$shown" "$shown_ts" \
     "$prev_prompt" "${turn_cost:-$cost}" "${turn_ctx:-$used}" "${last_call:-0}" "${ttl:-0}" \
-    "${ring_acc:-0}" "${woffset:-0}" \
+    "${ring_acc:-0}" "${woffset:-0}" "${sacc:-0}" \
     > "$state.tmp" 2>/dev/null && mv -f "$state.tmp" "$state" 2>/dev/null || true
 
   # Context, parked where the band hook can read it.
@@ -1175,6 +1331,17 @@ cmd_doctor() {
     printf '              run: rtc setup\n'
   fi
 
+  # The obvious question once Kimi counts subagents is whether Claude does, and
+  # the answer is that it already did. Measured across eight sessions on
+  # 2.1.227/2.1.228: pricing the parent transcript alone reaches 73-94% of
+  # cost.total_cost_usd, and adding the child transcripts under
+  # <session>/subagents/ closes it to 98.7-100%. So the host's figure is the
+  # whole bill, and rtc adding its own derived number would count it twice.
+  if [ -f "$SETTINGS" ]; then
+    printf '  claude      subagent spend is already inside the cost Claude Code reports —\n'
+    printf '              measured, not assumed; rtc adds nothing to it\n'
+  fi
+
   if [ -d "$KIMI_HOME" ]; then
     local kwired
     kwired=$(kimi_tui_command)
@@ -1213,10 +1380,34 @@ cmd_doctor() {
         printf "              cache %d day(s) old%s\n", d,
           (d > max) ? " — stale, a detached refresh fires on the next render" : "" }'
     done
-    local sf ksess kalias kmid
+    local sf ksess kalias kmid nsub ksacc
     while read -r sf; do
       case "$sf" in */rtc-kimi-*) ;; *) continue ;; esac
       ksess=${sf##*/rtc-kimi-}; ksess=${ksess%.state}
+
+      # Subagents bill on their own wires and the main one carries none of it,
+      # so a session's total silently missing a third of itself was the whole
+      # reason this pass exists. Say when a total includes that money.
+      if [ -r "$RUN/rtc-kimi-$ksess.subs" ]; then
+        nsub=$(wc -l < "$RUN/rtc-kimi-$ksess.subs"); nsub=$((nsub))
+        ksacc=$(cut -d' ' -f13 < "$sf" 2>/dev/null)
+        case "${ksacc:-}" in ''|*[!0-9.]*) ksacc=0 ;; esac
+        printf '  kimi agents %.8s — %s subagent wire(s) tailed, $%.2f of the total is theirs\n' \
+          "$ksess" "$nsub" "$ksacc"
+        # A subagent may run a model the main agent never touches, so its rate
+        # can be missing while the session's own is fine. That undercounts the
+        # total silently — the one failure this whole pass must not hide.
+        local sname soff salias
+        while read -r sname soff salias; do
+          [ -n "${salias:-}" ] || continue
+          price_for "${salias//[^A-Za-z0-9._-]/_}" && continue
+          printf '              %s runs %s — NO RATE, its spend is missing from the total\n' \
+            "$sname" "$salias"
+          printf '              fix: rtc rates, or RTC_PRICE_%s="input cache_read cache_write output"\n' \
+            "${salias//[^A-Za-z0-9_]/_}"
+        done < "$RUN/rtc-kimi-$ksess.subs"
+      fi
+
       kalias=""
       [ -r "$RUN/rtc-kimi-$ksess.wire" ] && { read -r _; read -r kalias; } < "$RUN/rtc-kimi-$ksess.wire" 2>/dev/null
       if [ -z "$kalias" ]; then
