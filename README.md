@@ -177,6 +177,7 @@ shell.
 | `RTC_ESTIMATE` | `1` | `0` hides the `[~$0.18]` submit-cost figure |
 | `RTC_SAMPLES` | `12` | recent requests kept to calibrate it |
 | `RTC_SOUND` | bundled | path to your own wav |
+| `RTC_VOLUME` | `0.8` | loudness, `0`-`1`; `aplay` has no per-call gain and ignores it |
 | `RTC_MUTE` | `0` | `1` keeps the number, drops the sound |
 | `RTC_PRICE_<model>` | — | Kimi only: `input cache_read cache_write output` in $/M. Beats the cache and the seed |
 | `RTC_RATES_MAX_AGE_DAYS` | `30` | Kimi price cache older than this self-refreshes on the next render |

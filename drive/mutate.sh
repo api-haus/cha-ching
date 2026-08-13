@@ -92,5 +92,9 @@ mutant 'a subagent wire is never tailed at all' drive-real \
   '  kimi_subagents "${wire%/main/wire.jsonl}" "$adopt"' \
   '  :'
 
+mutant 'a non-numeric RTC_VOLUME reaches the player unguarded' drive-ring \
+  '  case "$v" in '\'''\''|*[!0-9.]*) v=0.8 ;; esac' \
+  '  :'
+
 printf '\n%s caught, %s missed\n' "$caught" "$missed"
 [ "$missed" = 0 ]

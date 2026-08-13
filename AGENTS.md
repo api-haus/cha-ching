@@ -464,6 +464,14 @@ over Bluetooth, where resuming the A2DP link costs hundreds of milliseconds. The
 strike is in the first 50ms, so without the lead-in you hear the tail ring alone: a "ding" where a
 "ka-ching" should be. `share/ATTRIBUTION.md` carries the exact ffmpeg line to regenerate it.
 
+**`RTC_VOLUME` (default `0.8`) does not reach all four players the same way.** `pw-play` and `afplay`
+take a linear `0.0`-`1.0` fraction; `paplay` wants an integer up to `65536`; `aplay` — ALSA's own
+client, no PipeWire or PulseAudio server underneath — has no per-call gain flag at all and always
+plays at the file's own level, so it gets none. `ring_volume` clamps and defaults the value once,
+before any of that branching, because `afplay` is the player this project cannot run here to watch
+fail: it errors outside `0.0`-`1.0`, and a malformed flag would silently mean no sound on the one
+platform `drive/matrix.sh` can only simulate.
+
 ## Testing
 
 `drive/matrix.sh` — every drive, on every platform this project claims. It is not a unit-test suite

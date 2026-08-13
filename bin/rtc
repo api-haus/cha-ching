@@ -950,15 +950,37 @@ render() {
   }'
 }
 
+# Loudness, 0..1, read once and shared between play_sound and doctor. pw-play
+# and afplay take it as a linear fraction; paplay wants an integer up to
+# 65536; aplay has no per-call gain knob at all and always plays at the
+# file's own level. A negative or non-numeric RTC_VOLUME (the glob below
+# rejects the leading "-" along with any letter) falls back to the default
+# rather than reaching a player malformed; a value above 1 clamps to 1
+# instead. afplay in particular errors outside 0.0-1.0, and that is the one
+# player this project cannot run here to notice breaking.
+ring_volume() {
+  local v=${RTC_VOLUME:-0.8}
+  case "$v" in ''|*[!0-9.]*) v=0.8 ;; esac
+  awk -v v="$v" 'BEGIN { if (v > 1) v = 1; printf "%.3f", v }'
+}
+
 play_sound() {
   [ "${RTC_MUTE:-0}" = "1" ] && return 0
-  local wav p
+  local wav p vol
   wav=${RTC_SOUND:-$ROOT/share/cash-register.wav}
   [ -s "$wav" ] || return 0
+  vol=$(ring_volume)
   for p in pw-play paplay aplay afplay; do
     if command -v "$p" >/dev/null 2>&1; then
-      # Detached, so a wedged audio server never stalls a render.
-      detach "$p" "$wav"
+      # Detached, so a wedged audio server never stalls a render. The volume
+      # flag is chosen per player rather than appended once, because the
+      # four do not agree on its shape.
+      case "$p" in
+        pw-play) detach "$p" "--volume=$vol" "$wav" ;;
+        paplay)  detach "$p" "--volume=$(awk -v v="$vol" 'BEGIN { printf "%.0f", v * 65536 }')" "$wav" ;;
+        afplay)  detach "$p" -v "$vol" "$wav" ;;
+        *)       detach "$p" "$wav" ;;
+      esac
       return 0
     fi
   done
@@ -1371,7 +1393,14 @@ cmd_doctor() {
   for p in pw-play paplay aplay afplay; do
     command -v "$p" >/dev/null 2>&1 && { found=$p; break; }
   done
-  if [ -n "$found" ]; then printf '  player      %s\n' "$found"
+  if [ -n "$found" ]; then
+    printf '  player      %s\n' "$found"
+    if [ "$found" = aplay ]; then
+      printf '  volume      RTC_VOLUME=%s configured, but aplay has no per-call gain control —\n' "${RTC_VOLUME:-0.8}"
+      printf '              it always plays at the file'"'"'s own level\n'
+    else
+      printf '  volume      %s\n' "$(ring_volume)"
+    fi
   else printf '  player      none of pw-play/paplay/aplay/afplay — it will be silent\n'; fi
 
   if [ -s "$ROOT/share/cash-register.wav" ]; then printf '  sound       %s\n' "$ROOT/share/cash-register.wav"

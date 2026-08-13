@@ -1,6 +1,6 @@
 {
   "name": "realtokencost",
-  "version": "2.7.0",
+  "version": "2.8.0",
   "description": "Shows what submitting your current context costs before you send it, tracks whether the prompt cache is still alive, rings a cash register when money moves and warns as the window fills. Chains to any existing statusline instead of replacing it.",
   "author": {
     "name": "Kassinity"
