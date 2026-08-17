@@ -19,12 +19,15 @@
 # tokens times rates from `rtc rates` (models.dev) or an RTC_PRICE_* override.
 # Nothing about prices is compiled in.
 #
+# Codex has no status line command slot; see AGENTS.md for what it has instead.
+#
 #   rtc statusline   harvest, render, chain   (what the status line command runs)
 #   rtc hook         context band warnings    (wired by the plugin)
 #   rtc halt         mark a turn handing back (wired by the plugin)
+#   rtc codex        measure, render, ring    (every codex hook runs this)
 #   rtc setup        claim the status line slot, keeping what was there
 #   rtc uninstall    give it back
-#   rtc rates        fetch model prices from models.dev (Kimi money source)
+#   rtc rates        fetch model prices from models.dev (Kimi/Codex money source)
 #   rtc doctor       explain why it is quiet
 set -u
 
@@ -49,6 +52,9 @@ SETTINGS="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json"
 KIMI_HOME="${KIMI_CODE_HOME:-$HOME/.kimi-code}"
 KIMI_TUI="$KIMI_HOME/tui.toml"
 KIMI_CONF="$KIMI_HOME/config.toml"
+CODEX_DIR="${CODEX_HOME:-$HOME/.codex}"
+CODEX_HOOKS="$CODEX_DIR/hooks.json"
+CODEX_CONF="$CODEX_DIR/config.toml"
 
 # Config is a file rather than shell exports because hooks and the statusline are
 # launched by Claude Code, which need not have inherited your shell's env. A real
@@ -93,6 +99,10 @@ THRESHOLD=${RTC_THRESHOLD:-5}
 # existed. The eye stays per session either way — the floating number belongs to
 # the statusline it appears on.
 SCOPE=${RTC_RING_SCOPE:-global}
+
+# Which codex hook events render a line — submit, tool, stop. Setup wires only
+# the events named here, so changing it means running setup again.
+CODEX_RENDER=${RTC_CODEX_RENDER:-submit,stop}
 
 die() { printf '%s\n' "$*" >&2; exit 1; }
 
@@ -544,108 +554,120 @@ kimi_main_delta() {
   [ "${used:-0}" -gt 0 ] || used=$((nio + ncr + ncw))
 }
 
-# ── statusline ────────────────────────────────────────────────────────────────
-cmd_statusline() {
-  local payload platform model effort used size cost session
-  payload=$(cat)
+# ── codex measurement ─────────────────────────────────────────────────────────
+# Codex reports tokens and not dollars, so the money is priced the Kimi way —
+# from the rollout the hook payload names. See AGENTS.md for the rest.
 
-  # Two payload shapes share this entry point. Claude Code sends snake_case
-  # with cost and context_window; Kimi Code sends a camelCase snapshot with
-  # context but never cost (it is subscription-based), which is why cost is 0
-  # here and computed from the wire log further down instead.
-  IFS=$'\t' read -r platform model effort used size cost session prompt cwrite cread transcript modelid < <(
-    printf '%s' "$payload" | jq -r '
-      if .sessionId != null then
-        [ "kimi",
-          (if (.model // "") == "" then "?" else .model end),
-          "-",
-          (.contextTokens // 0),
-          (.maxContextTokens // 0),
-          0,
-          (.sessionId // ""),
-          "-",
-          0, 0, "",
-          "unknown"
-        ] | @tsv
-      else
-        [ "claude",
-          (.model.display_name // "?"),
-          (.effort.level // "-"),
-          (.context_window.total_input_tokens // 0),
-          (.context_window.context_window_size // 0),
-          (.cost.total_cost_usd // 0),
-          (.session_id // ""),
-          (.prompt_id // "-"),
-          (.context_window.current_usage.cache_creation_input_tokens // 0),
-          (.context_window.current_usage.cache_read_input_tokens // 0),
-          (.transcript_path // ""),
-          (.model.id // "unknown" | gsub("[^A-Za-z0-9._-]"; "_"))
-        ] | @tsv
-      end' 2>/dev/null
-  )
-  [ -n "${model:-}" ] || exit 0
+# Reads the complete lines past the rollout offset. Prints the new offset, then
+# "C <used> <size> <model>" for the last token_count row, then one
+# "M <model> <io> <cread> <cwrite> <out>" per model the chunk billed.
+codex_tail() {
+  local f="$1" off="$2" m0="$3" chunk complete
+  chunk=$(tail -c +"$((off + 1))" -- "$f" 2>/dev/null; printf x)
+  chunk=${chunk%x}
+  case "$chunk" in
+    "")      complete="" ;;
+    *$'\n')  complete=$chunk ;;
+    *$'\n'*) complete=${chunk%$'\n'*}$'\n' ;;
+    *)       complete="" ;;
+  esac
+  [ -n "$complete" ] || { printf '%s\n' "$off"; return; }
+  printf '%s\n' "$((off + ${#complete}))"
+  # input_tokens already contains the cached and the newly written halves, so
+  # the plain-input term is what is left after both are taken out of it.
+  printf '%s' "$complete" | jq -Rr '
+      fromjson? // empty
+      | if .type == "turn_context" then
+          ["T", (.payload.model // "")] | @tsv
+        elif .type == "event_msg" and .payload.type == "token_count"
+             and ((.payload.info | type) == "object") then
+          (.payload.info.last_token_usage // {}) as $u
+          | ["U", (($u.input_tokens // 0) - ($u.cached_input_tokens // 0)
+                    - ($u.cache_write_input_tokens // 0)),
+             ($u.cached_input_tokens // 0), ($u.cache_write_input_tokens // 0),
+             ($u.output_tokens // 0), ($u.total_tokens // 0),
+             (.payload.info.model_context_window // 0)] | @tsv
+        else empty end' 2>/dev/null |
+    awk -F'\t' -v m="$m0" '
+      $1 == "T" { if ($2 != "") m = $2; next }
+      $1 == "U" {
+        mm = (m == "" ? "unknown" : m)
+        io = $2 < 0 ? 0 : $2
+        i[mm] += io; cr[mm] += $3; cw[mm] += $4; o[mm] += $5
+        used = $6; size = $7; lastm = mm; seen = 1
+      }
+      END {
+        if (seen) printf "C %d %d %s\n", used, size, lastm
+        for (k in i) printf "M %s %d %d %d %d\n", k, i[k], cr[k], cw[k], o[k]
+      }'
+}
 
-  local now state tag last pending ring_ts shown shown_ts prev_prompt turn_cost turn_ctx last_call ttl
-  local ring_acc woffset sacc halt="" halted=0 pulse=0 ring=0 bump mainbump=0 money carry=0 deferred=0
-  local gring="" gts=0 gacc=0 locked=0 rts noprice=0
-  # Dollars this render's subagents added. Needed after the accounting below:
-  # subagent money counts towards the total, the ring and the floating number,
-  # but never towards the estimate — a subagent's request does not re-read the
-  # main context, so it measures nothing about what submitting that context
-  # costs.
-  local sbump=0
-  now=$(now_s)
-  tag=rtc
-  [ "$platform" = kimi ] && tag=rtc-kimi
-  state="$RUN/$tag-${session:-nosession}.state"
+# Cost under codex is a running total this script maintains, exactly as under
+# Kimi. Runs inside cmd_codex and edits its variables: cost, used, size,
+# cwrite, cread, modelid, woffset, noprice.
+codex_measure() {
+  local mf="$RUN/$tag-$session.model" m0="" was="" fsize from adopt=0 t newoff
+  local terms="" kind a b c d e add
+  [ -r "$mf" ] && read -r m0 < "$mf" 2>/dev/null
+  was=$m0
+  # The hook payload names the model this turn runs, which beats a remembered one.
+  [ -n "${model:-}" ] && m0=$model
+  cost=${last:-0}
+  [ -n "${transcript:-}" ] && [ -f "$transcript" ] || { noprice=1; return; }
+  fsize=$(stat -c %s "$transcript" 2>/dev/null || stat -f %z "$transcript" 2>/dev/null || printf '0')
+  case "${fsize:-}" in ''|*[!0-9]*) noprice=1; return ;; esac
 
-  last=""; pending=0; ring_ts=0; shown=0; shown_ts=0; prev_prompt="-"; turn_cost=""; turn_ctx=0
-  last_call=0; ttl=0; ring_acc=0; woffset=0; sacc=0
-  [ -r "$state" ] && IFS=' ' read -r last pending ring_ts shown shown_ts prev_prompt turn_cost turn_ctx last_call ttl ring_acc woffset sacc < "$state" 2>/dev/null
-  # A state file written before the ring had modes stops at ttl, and read leaves
-  # the field it never wrote empty rather than absent. Same for woffset, which
-  # only Kimi sessions use, and for sacc, which arrived with subagent spend.
-  [ -n "${ring_acc:-}" ] || ring_acc=0
-  case "${sacc:-}" in ''|*[!0-9.]*) sacc=0 ;; esac
-  # -1 is the unset sentinel: 0 is a valid wire offset (an empty wire adopts at
-  # size 0, and the first row appended must still count), so "never seen" has
-  # to be its own value.
-  case "${woffset:-}" in ''|*[!0-9-]*) woffset=-1 ;; esac
-
-  if [ "$platform" = kimi ] && [ -n "${session:-}" ]; then
-    kimi_measure
+  from=$woffset
+  if [ "$woffset" -lt 0 ] || [ "$fsize" -lt "$woffset" ]; then
+    # A resumed rollout is already full of history: read its tail for the
+    # context and the model, price none of it. A megabyte is far more than the
+    # last token_count row is ever buried under.
+    adopt=1; from=0
+    [ "$fsize" -gt 1048576 ] && from=$((fsize - 1048576))
   fi
 
-  # What a bare submit costs per million tokens is a property of the model, not
-  # of the session — it is essentially the cache-read rate. Learning it once and
-  # keeping it means a new session shows a figure on its first turn instead of
-  # spending two turns rediscovering a constant.
-  local ratefile="$CACHE_DIR/rate-${modelid:-unknown}"
-
-  # The turn handed back while we were not looking. Consumed on sight whether or
-  # not it becomes a ring — it happened once, and if no money moved with it there
-  # is nothing to announce. Under a shared ring it is consumed only once this
-  # session holds the lock, or a halt would be swallowed by a lock it lost.
-  if [ "$RING" = on_halt ]; then
-    halt="$RUN/$tag-${session:-nosession}.halt"
-    if [ -e "$halt" ]; then
-      halted=1
-      [ "$SCOPE" = session ] && { rm -f "$halt" 2>/dev/null || true; }
-    fi
-  fi
-
-  # A session knows nothing about its own context until its first response lands,
-  # so a turn that opened before that has 0 recorded against it and would be
-  # thrown away by the guard below — leaving a restarted session with no estimate
-  # for as long as it takes to complete two more turns. Adopt the first real
-  # figure that appears instead.
-  if [ "${turn_ctx:-0}" -le 0 ] && [ "${used:-0}" -gt 0 ]; then turn_ctx=$used; fi
-
-  if [ -z "${last:-}" ]; then
-    # First sight. Adopt the total silently — announcing a session's whole
-    # accumulated spend as a single hit would be a lie.
-    :
+  if [ "$fsize" -le "$from" ]; then
+    woffset=$fsize
   else
+    t=$(codex_tail "$transcript" "$from" "$m0")
+    newoff=${t%%$'\n'*}
+    case "${newoff:-}" in ''|*[!0-9]*) newoff=$fsize ;; esac
+    woffset=$newoff
+    case "$t" in
+      *$'\n'*)
+        while IFS=' ' read -r kind a b c d e; do
+          case "$kind" in
+            C) used=$a; size=$b; m0=$c ;;
+            M) [ "$adopt" = 1 ] && continue
+               cwrite=$((cwrite + d)); cread=$((cread + c))
+               price_for "${a//[^A-Za-z0-9._-]/_}" &&
+                 terms="$terms$b $c $d $e $PRICE"$'\n'
+               rates_maybe_refresh "${a//[^A-Za-z0-9._-]/_}" ;;
+          esac
+        done <<< "${t#*$'\n'}" ;;
+    esac
+  fi
+
+  modelid=$(printf '%s' "${m0:-unknown}" | tr -c 'A-Za-z0-9._-' '_')
+  if [ -n "${m0:-}" ] && [ "$m0" != "$was" ]; then
+    printf '%s\n' "$m0" > "$mf.tmp" 2>/dev/null && mv -f "$mf.tmp" "$mf" 2>/dev/null || true
+  fi
+  price_for "$modelid" || noprice=1
+  rates_maybe_refresh "$modelid"
+
+  [ -n "$terms" ] || return 0
+  add=$(printf '%s' "$terms" |
+    awk '{ d += ($1*$5 + $2*$6 + $3*$7 + $4*$8) / 1000000 } END { printf "%.6f", d }')
+  case "${add:-}" in ''|*[!0-9.]*) return 0 ;; esac
+  cost=$(awk -v b="${last:-0}" -v a="$add" 'BEGIN { printf "%.6f", b + a }')
+}
+
+# The accumulators, the ring and the sample — every platform that carries money
+# runs this. See AGENTS.md "The sound". Called from a render, edits its locals.
+money_step() {
+  # First sight: adopt the total silently rather than announce a whole session.
+  [ -n "${last:-}" ] || return 0
+  local money
     # Every bump accrues, into two accumulators that are released on different
     # terms. `pending` is money the eye has not been shown; `ring_acc` is money
     # the ear has not been told about. Rate-limiting is applied to the release,
@@ -746,7 +768,106 @@ cmd_statusline() {
       ring=0
       ring_acc=$deferred
     fi
+}
+
+# ── statusline ────────────────────────────────────────────────────────────────
+cmd_statusline() {
+  local payload platform model effort used size cost session
+  payload=$(cat)
+
+  # Two payload shapes share this entry point. Claude Code sends snake_case
+  # with cost and context_window; Kimi Code sends a camelCase snapshot with
+  # context but never cost (it is subscription-based), which is why cost is 0
+  # here and computed from the wire log further down instead.
+  IFS=$'\t' read -r platform model effort used size cost session prompt cwrite cread transcript modelid < <(
+    printf '%s' "$payload" | jq -r '
+      if .sessionId != null then
+        [ "kimi",
+          (if (.model // "") == "" then "?" else .model end),
+          "-",
+          (.contextTokens // 0),
+          (.maxContextTokens // 0),
+          0,
+          (.sessionId // ""),
+          "-",
+          0, 0, "",
+          "unknown"
+        ] | @tsv
+      else
+        [ "claude",
+          (.model.display_name // "?"),
+          (.effort.level // "-"),
+          (.context_window.total_input_tokens // 0),
+          (.context_window.context_window_size // 0),
+          (.cost.total_cost_usd // 0),
+          (.session_id // ""),
+          (.prompt_id // "-"),
+          (.context_window.current_usage.cache_creation_input_tokens // 0),
+          (.context_window.current_usage.cache_read_input_tokens // 0),
+          (.transcript_path // ""),
+          (.model.id // "unknown" | gsub("[^A-Za-z0-9._-]"; "_"))
+        ] | @tsv
+      end' 2>/dev/null
+  )
+  [ -n "${model:-}" ] || exit 0
+
+  local now state tag last pending ring_ts shown shown_ts prev_prompt turn_cost turn_ctx last_call ttl
+  local ring_acc woffset sacc halt="" halted=0 pulse=0 ring=0 bump mainbump=0 money carry=0 deferred=0
+  local gring="" gts=0 gacc=0 locked=0 rts noprice=0
+  # Dollars this render's subagents added. Needed after the accounting below:
+  # subagent money counts towards the total, the ring and the floating number,
+  # but never towards the estimate — a subagent's request does not re-read the
+  # main context, so it measures nothing about what submitting that context
+  # costs.
+  local sbump=0
+  now=$(now_s)
+  tag=rtc
+  [ "$platform" = kimi ] && tag=rtc-kimi
+  state="$RUN/$tag-${session:-nosession}.state"
+
+  last=""; pending=0; ring_ts=0; shown=0; shown_ts=0; prev_prompt="-"; turn_cost=""; turn_ctx=0
+  last_call=0; ttl=0; ring_acc=0; woffset=0; sacc=0
+  [ -r "$state" ] && IFS=' ' read -r last pending ring_ts shown shown_ts prev_prompt turn_cost turn_ctx last_call ttl ring_acc woffset sacc < "$state" 2>/dev/null
+  # A state file written before the ring had modes stops at ttl, and read leaves
+  # the field it never wrote empty rather than absent. Same for woffset, which
+  # only Kimi sessions use, and for sacc, which arrived with subagent spend.
+  [ -n "${ring_acc:-}" ] || ring_acc=0
+  case "${sacc:-}" in ''|*[!0-9.]*) sacc=0 ;; esac
+  # -1 is the unset sentinel: 0 is a valid wire offset (an empty wire adopts at
+  # size 0, and the first row appended must still count), so "never seen" has
+  # to be its own value.
+  case "${woffset:-}" in ''|*[!0-9-]*) woffset=-1 ;; esac
+
+  if [ "$platform" = kimi ] && [ -n "${session:-}" ]; then
+    kimi_measure
   fi
+
+  # What a bare submit costs per million tokens is a property of the model, not
+  # of the session — it is essentially the cache-read rate. Learning it once and
+  # keeping it means a new session shows a figure on its first turn instead of
+  # spending two turns rediscovering a constant.
+  local ratefile="$CACHE_DIR/rate-${modelid:-unknown}"
+
+  # The turn handed back while we were not looking. Consumed on sight whether or
+  # not it becomes a ring — it happened once, and if no money moved with it there
+  # is nothing to announce. Under a shared ring it is consumed only once this
+  # session holds the lock, or a halt would be swallowed by a lock it lost.
+  if [ "$RING" = on_halt ]; then
+    halt="$RUN/$tag-${session:-nosession}.halt"
+    if [ -e "$halt" ]; then
+      halted=1
+      [ "$SCOPE" = session ] && { rm -f "$halt" 2>/dev/null || true; }
+    fi
+  fi
+
+  # A session knows nothing about its own context until its first response lands,
+  # so a turn that opened before that has 0 recorded against it and would be
+  # thrown away by the guard below — leaving a restarted session with no estimate
+  # for as long as it takes to complete two more turns. Adopt the first real
+  # figure that appears instead.
+  if [ "${turn_ctx:-0}" -le 0 ] && [ "${used:-0}" -gt 0 ]; then turn_ctx=$used; fi
+
+  money_step
 
   # prompt_id changing means a new prompt started. Sampling no longer waits for
   # that — it happens on every request — so this boundary now only paces the
@@ -895,11 +1016,14 @@ estimate() {
 
 render() {
   awk -v model="$1" -v effort="$2" -v used="$3" -v size="$4" -v cost="$5" \
-      -v delta="$6" -v dts="$7" -v now="$8" -v est="$9" -v fade="$FADE" '
+      -v delta="$6" -v dts="$7" -v now="$8" -v est="$9" -v plain="${10:-}" -v fade="$FADE" '
   function scale(n) { return n >= 1000000 ? sprintf("%.2fM", n/1000000) : sprintf("%.0fk", n/1000) }
-  function rgb(r, g, b) { return sprintf("\033[38;2;%d;%d;%dm", r, g, b) }
+  # Codex renders a hook systemMessage as plain text and drops every escape in
+  # it, so the same line has to be able to come out without any.
+  function rgb(r, g, b) { return plain != "" ? "" : sprintf("\033[38;2;%d;%d;%dm", r, g, b) }
   BEGIN {
     RESET = "\033[0m"; DIM = "\033[2m"
+    if (plain != "") { RESET = ""; DIM = "" }
     out = DIM model RESET
     if (effort != "-" && effort != "null" && effort != "") out = out " " DIM effort RESET
 
@@ -943,7 +1067,7 @@ render() {
     if (cost + 0 >= 0 && dts > 0 && delta > 0 && age < fade) {
       t = age / fade
       k = t < 0.15 ? 0 : (t - 0.15) / 0.85     # holds bright for a beat, then falls
-      bold = t < 0.15 ? "\033[1m" : ""
+      bold = (t < 0.15 && plain == "") ? "\033[1m" : ""
       out = out sprintf("  %s%s+$%.2f%s", bold, rgb(134 + (26-134)*k, 239 + (48-239)*k, 172 + (36-172)*k), delta, RESET)
     }
     printf "%s", out
@@ -988,12 +1112,17 @@ play_sound() {
 
 # ── context band hook ─────────────────────────────────────────────────────────
 cmd_hook() {
-  local payload platform tag session ctx used size band last state
+  local payload platform tag session ctx used size msg
   payload=$(cat)
-  # Kimi hook payloads name their event; Claude ones do not. Both carry
-  # session_id. Only the reply format differs: Kimi appends stdout to the
-  # context as plain text, Claude wants a systemMessage JSON object.
-  platform=$(printf '%s' "$payload" | jq -r 'if .hook_event_name != null then "kimi" else "claude" end' 2>/dev/null)
+  # Kimi hook payloads name their event and Claude ones do not; codex names its
+  # event too, but is the only one of the three that also hands over a
+  # transcript path. Both carry session_id. Only the reply format differs: Kimi
+  # appends stdout to the context as plain text, Claude wants a systemMessage
+  # JSON object.
+  platform=$(printf '%s' "$payload" | jq -r '
+    if .hook_event_name != null and .transcript_path != null then "codex"
+    elif .hook_event_name != null then "kimi" else "claude" end' 2>/dev/null)
+  [ "$platform" = codex ] && { cmd_codex "$payload"; return; }
   session=$(printf '%s' "$payload" | jq -r '.session_id // empty' 2>/dev/null)
   [ -n "$session" ] || exit 0
   tag=rtc
@@ -1022,27 +1151,35 @@ cmd_hook() {
   fi
   IFS=' ' read -r used size < "$ctx" 2>/dev/null
   case "${used:-}${size:-}" in ''|*[!0-9]*) exit 0 ;; esac
-  [ "${size:-0}" -gt 0 ] || exit 0
 
-  band=$(( used * 100 / size / BANDS ))
-  [ "$band" -ge 1 ] || exit 0
-
-  state="$RUN/$tag-${session}.band"
-  last=0
-  [ -r "$state" ] && last=$(cat "$state" 2>/dev/null)
-  case "$last" in ''|*[!0-9]*) last=0 ;; esac
-  [ "$band" -gt "$last" ] || exit 0             # once per band, on the way up
-  printf '%s' "$band" > "$state" 2>/dev/null || true
-
-  # Report where the window actually is. The band is only what triggered this —
-  # saying "40%" while the window sits at 45% disagrees with the statusline for
-  # no reason, and the statusline is right.
-  local msg="context $(awk -v u="$used" -v s="$size" 'BEGIN { printf "%d", u * 100 / s }')% used — $(human "$used") of $(human "$size") tokens"
+  msg=$(band_msg "$tag" "$session" "$used" "$size")
+  [ -n "$msg" ] || exit 0
   if [ "$platform" = kimi ]; then
     printf '%s\n' "$msg"
   else
     jq -n --arg m "$msg" '{systemMessage: $m}'
   fi
+}
+
+# The band this context has just crossed, once, on the way up — or nothing.
+# Reports where the window actually is rather than the band that triggered it:
+# saying "40%" while the window sits at 45% disagrees with the gauge beside it
+# for no reason, and the gauge is right.
+band_msg() {                    # band_msg <tag> <session> <used> <size>
+  local tag="$1" session="$2" used="$3" size="$4" band state last
+  case "${used:-}${size:-}" in ''|*[!0-9]*) return 0 ;; esac
+  [ "${size:-0}" -gt 0 ] || return 0
+  band=$(( used * 100 / size / BANDS ))
+  [ "$band" -ge 1 ] || return 0
+  state="$RUN/$tag-$session.band"
+  last=0
+  [ -r "$state" ] && last=$(cat "$state" 2>/dev/null)
+  case "$last" in ''|*[!0-9]*) last=0 ;; esac
+  [ "$band" -gt "$last" ] || return 0
+  printf '%s' "$band" > "$state" 2>/dev/null || true
+  printf 'context %s%% used — %s of %s tokens' \
+    "$(awk -v u="$used" -v s="$size" 'BEGIN { printf "%d", u * 100 / s }')" \
+    "$(human "$used")" "$(human "$size")"
 }
 
 human() { awk -v n="$1" 'BEGIN { printf (n >= 1000000 ? "%.2fM" : "%.0fk"), n / (n >= 1000000 ? 1000000 : 1000) }'; }
@@ -1062,16 +1199,106 @@ human() { awk -v n="$1" 'BEGIN { printf (n >= 1000000 ? "%.2fM" : "%.0fk"), n / 
 # within the last second while the cached lines beside them were minutes old —
 # so a marker is never left sitting for longer than that.
 cmd_halt() {
-  [ "$RING" = on_halt ] || exit 0
   local payload platform session tag
   payload=$(cat)
   IFS=$'\t' read -r platform session < <(
-    printf '%s' "$payload" | jq -r '[(if .hook_event_name != null then "kimi" else "claude" end), (.session_id // "")] | @tsv' 2>/dev/null
+    printf '%s' "$payload" | jq -r '[(if .hook_event_name != null and .transcript_path != null then "codex"
+      elif .hook_event_name != null then "kimi" else "claude" end), (.session_id // "")] | @tsv' 2>/dev/null
   )
+  [ "$platform" = codex ] && { cmd_codex "$payload"; return; }
+  [ "$RING" = on_halt ] || exit 0
   [ -n "$session" ] || exit 0
   tag=rtc
   [ "$platform" = kimi ] && tag=rtc-kimi
   : > "$RUN/$tag-$session.halt" 2>/dev/null || true
+}
+
+# ── codex ─────────────────────────────────────────────────────────────────────
+# Codex has no status line command slot, so the segment is delivered as the
+# systemMessage of a hook — rendered by the TUI, never seen by the model, and
+# stripped of every escape on the way, which is why it renders plain. Every
+# codex hook runs this and the event decides what it does.
+cmd_codex() {
+  local payload event session transcript model turn used size cost prompt
+  payload=${1:-}
+  [ -n "$payload" ] || payload=$(cat)
+  IFS=$'\t' read -r event session transcript model turn < <(
+    printf '%s' "$payload" | jq -r '[(.hook_event_name // ""), (.session_id // ""),
+      (.transcript_path // ""), (.model // ""), (.turn_id // "-")] | @tsv' 2>/dev/null
+  )
+  [ -n "${session:-}" ] || exit 0
+
+  local show=0 halted=0
+  case "$event" in
+    UserPromptSubmit) case ",$CODEX_RENDER," in *,submit,*) show=1 ;; esac ;;
+    PostToolUse)      case ",$CODEX_RENDER," in *,tool,*) show=1 ;; esac ;;
+    # Nothing renders after a codex turn ends, so unlike Claude the ring sounds
+    # here rather than leaving a marker for a later render: by Stop the rollout
+    # already carries the completed request, which is exactly what the Claude
+    # side cannot say.
+    Stop)             halted=1; case ",$CODEX_RENDER," in *,stop,*) show=1 ;; esac ;;
+    SessionStart)     ;;
+    *) exit 0 ;;
+  esac
+
+  local now state tag last pending ring_ts shown shown_ts prev_prompt turn_cost turn_ctx last_call ttl
+  local ring_acc woffset sacc halt="" pulse=0 ring=0 bump mainbump=0 money carry=0 deferred=0
+  local gring="" gts=0 gacc=0 locked=0 rts noprice=0 sbump=0 cwrite=0 cread=0 modelid=unknown ratefile
+  now=$(now_s)
+  tag=rtc-codex
+  state="$RUN/$tag-$session.state"
+  prompt=$turn
+
+  last=""; pending=0; ring_ts=0; shown=0; shown_ts=0; prev_prompt="-"; turn_cost=""; turn_ctx=0
+  # -1, not 0: a session with no state file has never seen its rollout, and 0
+  # would read as "seen, and empty" — which prices the whole resumed history.
+  last_call=0; ttl=0; ring_acc=0; woffset=-1; sacc=0
+  [ -r "$state" ] && IFS=' ' read -r last pending ring_ts shown shown_ts prev_prompt turn_cost turn_ctx last_call ttl ring_acc woffset sacc < "$state" 2>/dev/null
+  [ -n "${ring_acc:-}" ] || ring_acc=0
+  case "${sacc:-}" in ''|*[!0-9.]*) sacc=0 ;; esac
+  case "${woffset:-}" in ''|*[!0-9-]*) woffset=-1 ;; esac
+
+  # An event that bills nothing still has a window to draw, so the last one
+  # measured is kept where the band hook already looks for it.
+  used=0; size=0
+  [ -r "$RUN/$tag-$session.ctx" ] && IFS=' ' read -r used size < "$RUN/$tag-$session.ctx" 2>/dev/null
+  case "${used:-}" in ''|*[!0-9]*) used=0 ;; esac
+  case "${size:-}" in ''|*[!0-9]*) size=0 ;; esac
+
+  codex_measure
+  ratefile="$CACHE_DIR/rate-${modelid:-unknown}"
+  if [ "${turn_ctx:-0}" -le 0 ] && [ "${used:-0}" -gt 0 ]; then turn_ctx=$used; fi
+
+  money_step
+
+  if [ "$prompt" != "$prev_prompt" ]; then
+    prev_prompt=$prompt
+    turn_cost=$cost
+    turn_ctx=$used
+  fi
+
+  printf '%s %s %s %s %s %s %s %s %s %s %s %s %s\n' "$cost" "$pending" "$ring_ts" "$shown" "$shown_ts" \
+    "$prev_prompt" "${turn_cost:-$cost}" "${turn_ctx:-$used}" "${last_call:-0}" "${ttl:-0}" \
+    "${ring_acc:-0}" "${woffset:-0}" "${sacc:-0}" \
+    > "$state.tmp" 2>/dev/null && mv -f "$state.tmp" "$state" 2>/dev/null || true
+  printf '%s %s\n' "$used" "$size" > "$RUN/$tag-$session.ctx" 2>/dev/null || true
+
+  [ "$ring" = 1 ] && play_sound
+  [ "$show" = 1 ] || return 0
+
+  local est="" segment band disp_cost="$cost" disp_shown="$shown"
+  if [ "$noprice" = 1 ]; then disp_cost=-1; disp_shown=0
+  elif [ "$ESTIMATE" != "0" ]; then
+    # Codex publishes no prompt-cache TTL, so the estimate carries no expiry
+    # countdown here — the warm figure, and nothing it cannot stand behind.
+    est=$(estimate "$tag-$session" "$used" "${last_call:-0}" 0 "$now" "$ratefile" 2>/dev/null)
+  fi
+  segment=$(render "${model:-?}" "-" "$used" "$size" "$disp_cost" "$disp_shown" \
+                   "$shown_ts" "$now" "${est:-}" plain)
+  band=$(band_msg "$tag" "$session" "$used" "$size")
+  [ -n "$band" ] && segment="${segment:+$segment  }$band"
+  [ -n "$segment" ] || return 0
+  jq -n --arg m "$segment" '{systemMessage: $m}'
 }
 
 # ── setup ─────────────────────────────────────────────────────────────────────
@@ -1084,7 +1311,45 @@ cmd_setup() {
   local did=0
   if [ -f "$SETTINGS" ]; then setup_claude; did=1; fi
   if [ -d "$KIMI_HOME" ]; then setup_kimi; did=1; fi
-  [ "$did" = 1 ] || die "found neither $SETTINGS nor $KIMI_HOME — is Claude Code or Kimi Code installed?"
+  if [ -d "$CODEX_DIR" ]; then setup_codex; did=1; fi
+  [ "$did" = 1 ] || die "found none of $SETTINGS, $KIMI_HOME or $CODEX_DIR — is a supported CLI installed?"
+}
+
+# Which events setup wires into codex. A hook that would render nothing is a
+# process per tool call for no reason, so RTC_CODEX_RENDER decides the wiring
+# and not just the output — changing it means running setup again.
+codex_hook_events() {
+  printf 'UserPromptSubmit\nStop\n'
+  case ",$CODEX_RENDER," in *,tool,*) printf 'PostToolUse\n' ;; esac
+}
+
+# One hook group of ours, under any path a previous version was installed at,
+# so an upgrade replaces its predecessor rather than rendering twice beside it.
+CODEX_MINE='([.hooks[]?.command] | map(test("rtc\"? codex( |$)")) | any)'
+
+setup_codex() {
+  printf 'codex: %s\n' "$CODEX_DIR"
+  local cmd tmp evs backup
+  cmd="\"$SELF\" codex"
+  [ -f "$CODEX_HOOKS" ] || printf '{"hooks":{}}\n' > "$CODEX_HOOKS"
+  backup="$CODEX_HOOKS.realtokencost.bak"
+  cp "$CODEX_HOOKS" "$backup"
+  evs=$(codex_hook_events | jq -Rn '[inputs]')
+  tmp=$(mktemp)
+  jq --arg cmd "$cmd" --argjson evs "$evs" "
+      .hooks = ((.hooks // {}) | map_values(map(select(($CODEX_MINE) | not))))
+    | .hooks |= with_entries(select(.value | length > 0))
+    | reduce \$evs[] as \$e (.;
+        .hooks[\$e] = ((.hooks[\$e] // []) + [{hooks: [{type: \"command\", command: \$cmd}]}]))
+  " "$CODEX_HOOKS" > "$tmp" && jq empty "$tmp" && mv "$tmp" "$CODEX_HOOKS" \
+    || die "failed to write $CODEX_HOOKS (backup at $backup)"
+
+  printf '  hooks wired for %s(backup at %s)\n' "$(codex_hook_events | tr '\n' ' ')" "$backup"
+  printf '  codex will not run a hook it has not been shown: start codex, run\n'
+  printf '  /hooks, press t. It asks again every time the command line changes.\n'
+  printf '  codex has no status line command slot, so the segment arrives as a\n'
+  printf '  hook systemMessage — RTC_CODEX_RENDER=%s decides on which events.\n' "$CODEX_RENDER"
+  cmd_rates || true
 }
 
 # Never chain to ourselves, under any name we have ever had. Re-running setup,
@@ -1215,11 +1480,11 @@ EOF
 # the "kimi-" prefix, which is the shape moonshotai publishes under.
 #
 # Runs inside cmd_rates. Edits pairs.
-rates_add_alias() {
+rates_add_alias() {             # rates_add_alias <alias> <first-party provider>
   local nl=$'\n' tab=$'\t'
   case "${1:-}" in '') return 0 ;; esac
   case "$nl$pairs" in *"$nl$1$tab"*) return 0 ;; esac
-  pairs="${pairs:+$pairs$nl}$1$tab${1##*/}"
+  pairs="${pairs:+$pairs$nl}$1$tab${1##*/}$tab${2:-}"
 }
 
 # Kimi reports usage, never dollars — the money features price measured tokens
@@ -1234,7 +1499,7 @@ cmd_rates() {
   command -v jq >/dev/null 2>&1 || die "realtokencost needs jq."
 
   local pairs="" api
-  # "alias<TAB>model id" for every [models.*] table
+  # "alias<TAB>model id<TAB>first-party provider" for every [models.*] table
   [ -f "$KIMI_CONF" ] && pairs=$(awk '
     /^\[models\./ {
       hdr=$0; sub(/^\[models\./, "", hdr); sub(/\][[:space:]]*$/, "", hdr)
@@ -1243,8 +1508,25 @@ cmd_rates() {
     /^\[/ { inm=0 }
     inm && /^[[:space:]]*model[[:space:]]*=/ {
       v=$0; sub(/^[^=]*=[[:space:]]*/, "", v); gsub(/"/, "", v)
-      print alias "\t" v
+      print alias "\t" v "\tmoonshotai"
     }' "$KIMI_CONF")
+
+  # Codex names one model and one provider in config.toml, and a profile can
+  # name another. Its custom-provider setups are the point of this — a
+  # deepseek base_url makes the roster deepseek's, not OpenAI's.
+  local cprov cm
+  if [ -f "$CODEX_CONF" ]; then
+    cprov=$(awk -F'=' '/^[[:space:]]*model_provider[[:space:]]*=/ {
+      gsub(/[" ]/, "", $2); print $2; exit }' "$CODEX_CONF")
+    while read -r cm; do rates_add_alias "$cm" "${cprov:-openai}"; done < <(awk -F'=' '
+      /^[[:space:]]*model[[:space:]]*=/ { gsub(/[" ]/, "", $2); if ($2 != "") print $2 }' "$CODEX_CONF")
+  fi
+  local xf
+  for xf in "$RUN"/rtc-codex-*.model; do
+    [ -r "$xf" ] || continue
+    read -r cm < "$xf" 2>/dev/null
+    rates_add_alias "${cm:-}" "${cprov:-openai}"
+  done
 
   # config.toml is not the whole roster. A model alias also arrives on the
   # usage.record rows themselves, and a subagent's need never have a
@@ -1260,15 +1542,17 @@ cmd_rates() {
     [ -r "$wf" ] || continue
     alias=""
     { read -r _; read -r alias; } < "$wf" 2>/dev/null
-    rates_add_alias "$alias"
+    rates_add_alias "$alias" moonshotai
   done
   for wf in "$RUN"/rtc-kimi-*.subs; do
     [ -r "$wf" ] || continue
-    while read -r _ _ alias; do rates_add_alias "${alias:-}"; done < "$wf"
+    while read -r _ _ alias; do rates_add_alias "${alias:-}" moonshotai; done < "$wf"
   done
 
   [ -n "$pairs" ] || {
-    printf 'rates: no [models.*] tables in %s and no wire has named a model yet\n' "$KIMI_CONF"
+    printf 'rates: nothing to price — no [models.*] tables in %s, no model in %s,\n' \
+      "$KIMI_CONF" "$CODEX_CONF"
+    printf '       and no session has named one yet\n'
     return 1
   }
 
@@ -1280,13 +1564,16 @@ cmd_rates() {
   }
   printf '%s' "$api" | jq empty 2>/dev/null || { printf 'rates: models.dev returned unparseable JSON — nothing written\n'; return 1; }
 
-  local alias mid san key provider input output cr cw hits line
-  printf '%s\n' "$pairs" | while IFS=$'\t' read -r alias mid; do
+  local alias mid hint san key provider input output cr cw hits line
+  printf '%s\n' "$pairs" | while IFS=$'\t' read -r alias mid hint; do
     [ -n "$mid" ] || continue
     san=$(printf '%s' "$alias" | tr -c 'A-Za-z0-9._-' '_')
-    hits=$(printf '%s' "$api" | jq -r --arg m "$mid" '
+    # moonshotai publishes k2 as kimi-k2, and several gateways carry a model
+    # under its own vendor's name — so the id, the kimi- spelling, and the
+    # vendor-prefixed one are all the same question.
+    hits=$(printf '%s' "$api" | jq -r --arg m "$mid" --arg h "${hint:-}" '
       to_entries[] | .key as $p | (.value.models // {}) | to_entries[] |
-      select(.key == $m or .key == ("kimi-" + $m)) |
+      select(.key == $m or .key == ("kimi-" + $m) or .key == ($h + "/" + $m)) |
       [$p, .key, (.value.cost.input // ""), (.value.cost.output // ""),
        (.value.cost.cache_read // ""), (.value.cost.cache_write // "")] | @tsv')
     if [ -z "$hits" ]; then
@@ -1301,8 +1588,9 @@ cmd_rates() {
     # a different question.
     local nhits
     nhits=$(printf '%s\n' "$hits" | wc -l); nhits=$((nhits))
-    line=$(printf '%s\n' "$hits" | awk -F'\t' '$1 == "moonshotai" { print; exit }')
-    [ -n "$line" ] || line=$(printf '%s\n' "$hits" | awk -F'\t' '$1 == "moonshotai-cn" { print; exit }')
+    line=$(printf '%s\n' "$hits" | awk -F'\t' -v h="${hint:-}" 'h != "" && $1 == h { print; exit }')
+    [ -n "$line" ] || line=$(printf '%s\n' "$hits" | awk -F'\t' -v h="${hint:-}" \
+      'h != "" && $1 == h "-cn" { print; exit }')
     [ -n "$line" ] || line=$(printf '%s\n' "$hits" | awk -F'\t' '$3 + 0 > 0 { print; exit }')
     [ -n "$line" ] || line=$(printf '%s\n' "$hits" | head -1)
     IFS=$'\t' read -r provider key input output cr cw <<< "$line"
@@ -1362,6 +1650,14 @@ cmd_uninstall() {
       { print }' "$KIMI_TUI" > "$tmp" && [ -s "$tmp" ] && mv "$tmp" "$KIMI_TUI" || rm -f "$tmp"
     printf 'kimi: status_line handed back%s\n' "$([ -n "$chain" ] && printf ' (chained to %s)' "$chain")"
   fi
+  if [ -f "$CODEX_HOOKS" ]; then
+    tmp=$(mktemp)
+    jq "
+        .hooks = ((.hooks // {}) | map_values(map(select(($CODEX_MINE) | not))))
+      | .hooks |= with_entries(select(.value | length > 0))" "$CODEX_HOOKS" > "$tmp" &&
+      jq empty "$tmp" && mv "$tmp" "$CODEX_HOOKS" || rm -f "$tmp"
+    printf 'codex: hooks removed from %s\n' "$CODEX_HOOKS"
+  fi
   if grep -q '^# >>> realtokencost' "$KIMI_CONF" 2>/dev/null; then
     tmp=$(mktemp)
     awk '/^# >>> realtokencost/ { skip=1; next }
@@ -1380,7 +1676,10 @@ cmd_uninstall() {
 # session rewrites its state on every render, so recency is what live means.
 # `-mmin` rather than `-newermt`: both GNU and BSD find have it, and the minute
 # is generous against a one-second refreshInterval.
-live_states() { find "$RUN" -maxdepth 1 -name 'rtc-*.state' -mmin -1 2>/dev/null; }
+# Codex sessions are left out: they render on hooks rather than on a timer, so
+# recency says nothing about whether one is open, and the per-second arithmetic
+# below is not about them. The codex block reports them on its own terms.
+live_states() { find "$RUN" -maxdepth 1 -name 'rtc-*.state' ! -name 'rtc-codex-*.state' -mmin -1 2>/dev/null; }
 
 cmd_doctor() {
   local ok stale p found wired
@@ -1560,10 +1859,50 @@ cmd_doctor() {
     printf '  kimi ttl    unpublished — estimates show the warm price, no expiry countdown\n'
   fi
 
+  if [ -d "$CODEX_DIR" ]; then
+    local cwired ctrust xf xsess xmodel
+    cwired=$(jq -r "[(.hooks // {}) | to_entries[] | select(.value | map($CODEX_MINE) | any) | .key] | join(\" \")" \
+      "$CODEX_HOOKS" 2>/dev/null)
+    if [ -n "${cwired:-}" ]; then
+      printf '  codex hooks wired for %s\n' "$cwired"
+    else
+      printf '  codex hooks NOT wired in %s\n' "$CODEX_HOOKS"
+      printf '              run: rtc setup\n'
+    fi
+    # Codex refuses to run a hook whose command line it has not been shown, and
+    # a refused hook is indistinguishable from a broken one from the outside.
+    ctrust=$(grep -c 'hooks\.json:' "$CODEX_CONF" 2>/dev/null); ctrust=$((ctrust))
+    if [ "$ctrust" = 0 ]; then
+      printf '  codex trust nothing trusted yet — codex skips an unreviewed hook silently\n'
+      printf '              fix: start codex, run /hooks, press t\n'
+    else
+      printf '  codex trust %s hook(s) recorded in %s\n' "$ctrust" "$CODEX_CONF"
+      printf '              codex asks again whenever a command line changes\n'
+    fi
+    printf '  codex line  codex has no status line command slot — the segment is a hook\n'
+    printf '              systemMessage, rendering on: %s (RTC_CODEX_RENDER)\n' "$CODEX_RENDER"
+    printf '  codex ttl   unpublished — estimates show the warm price, no expiry countdown\n'
+    for xf in "$RUN"/rtc-codex-*.model; do
+      [ -r "$xf" ] || continue
+      xsess=${xf##*/rtc-codex-}; xsess=${xsess%.model}
+      read -r xmodel < "$xf" 2>/dev/null
+      [ -n "${xmodel:-}" ] || continue
+      if price_for "${xmodel//[^A-Za-z0-9._-]/_}"; then
+        printf '  codex sess  %.8s runs %s — %s rate, %s turn(s) behind its estimate\n' \
+          "$xsess" "$xmodel" "$PRICE_SRC" \
+          "$(if [ -r "$RUN/rtc-codex-$xsess.turns" ]; then wc -l < "$RUN/rtc-codex-$xsess.turns" | tr -d ' '; else printf 0; fi)"
+      else
+        printf '  codex price %.8s runs %s — NO RATE, money features are off for it\n' "$xsess" "$xmodel"
+        printf '              fix: rtc rates, or RTC_PRICE_%s="input cache_read cache_write output" in %s\n' \
+          "${xmodel//[^A-Za-z0-9_]/_}" "$CONFIG"
+      fi
+    done
+  fi
+
   [ -n "${RTC_CHAIN:-}" ] && printf '  chain       %s\n' "$RTC_CHAIN"
 
   ok=$(live_states | wc -l); ok=$((ok))
-  stale=$(ls "$RUN"/rtc-*.state 2>/dev/null | wc -l); stale=$(( stale - ok ))
+  stale=$(ls "$RUN"/rtc-*.state 2>/dev/null | grep -vc 'rtc-codex-'); stale=$(( stale - ok ))
   printf '  live data   %s session(s) rendering now\n' "$ok"
   if [ "$stale" -gt 0 ]; then
     printf '              %s state file(s) left behind by sessions that have ended. They cost\n' "$stale"
@@ -1625,11 +1964,12 @@ case "${1:-statusline}" in
   statusline) cmd_statusline ;;
   hook)       cmd_hook ;;
   halt)       cmd_halt ;;
+  codex)      cmd_codex ;;
   setup)      cmd_setup ;;
   uninstall)  cmd_uninstall ;;
   rates)      cmd_rates ;;
   doctor)     cmd_doctor ;;
   -h|--help|help)
     sed -n '2,27p' "$SELF" | sed 's/^# \{0,1\}//' ;;
-  *) die "unknown command: $1 (try: statusline, hook, halt, setup, uninstall, rates, doctor)" ;;
+  *) die "unknown command: $1 (try: statusline, hook, halt, codex, setup, uninstall, rates, doctor)" ;;
 esac

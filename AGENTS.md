@@ -1,14 +1,14 @@
 # AGENTS.md
 
-realtokencost (`rtc`) is a plugin for Claude Code and Kimi Code: a statusline segment plus a hook.
-It shows what submitting the current context costs *before* you press enter, whether the prompt
-cache is still alive to make that the cheap number, rings a cash register when money moves, and
-warns as the window fills. `README.md` is written for users; this file is what you need to change
-the thing.
+realtokencost (`rtc`) is a plugin for Claude Code, Kimi Code and OpenAI Codex: a statusline segment
+plus a hook. It shows what submitting the current context costs *before* you press enter, whether
+the prompt cache is still alive to make that the cheap number, rings a cash register when money
+moves, and warns as the window fills. `README.md` is written for users; this file is what you need
+to change the thing.
 
-Everything below was verified against Claude Code 2.1.227 and Kimi Code 0.34.0 by reading the
-binaries and live payloads. Where a claim is checkable, the check is named. Re-verify rather than
-trust if a claim starts costing you time — both CLIs move.
+Everything below was verified against Claude Code 2.1.227, Kimi Code 0.34.0 and Codex 0.147.0 by
+reading the binaries and live payloads. Where a claim is checkable, the check is named. Re-verify
+rather than trust if a claim starts costing you time — all three CLIs move.
 
 ## The constraints that shape the design
 
@@ -19,6 +19,39 @@ there is no `pluginStatusLine` identifier in the binary. Hooks install themselve
 `hooks/hooks.json`; the statusline needs `rtc setup` to write `settings.json`. This asymmetry is why
 setup exists at all. Kimi Code has the same asymmetry with different names: `kimi.plugin.json`
 carries hooks but `[status_line].command` lives in `tui.toml`, which only setup writes.
+
+**Codex has no statusline slot to claim at all.** `[tui].status_line` is not a command — it is a
+picker over a fixed list of built-in items (`project-name`, `current-dir`, `run-state`, `thread`,
+`thread-title`, `git-branch`, `context-remaining`, `context-used`, `five-hour-limit`,
+`weekly-limit`, `codex-version`, `used-tokens`, `total-input-tokens`, `total-output-tokens`,
+`thread-id`, `fast-mode`, `model`, `model-with-reasoning`, `reasoning`, `task-progress`,
+`pull-request-number`, `branch-changes`, `approval-mode`, `context-window-size`, `raw-output`,
+`workspace-headline`). There is no custom entry and no plugin contribution point; `/statusline` only
+ticks boxes. Read the ids straight out of the binary if you doubt it — they sit beside "Select which
+items to display in the status line".
+
+So on codex the segment is delivered as a hook `systemMessage`, which is not a workaround for the
+missing slot but the only surface there is. Two measured properties make it work. It renders in the
+TUI and does **not** enter the conversation — a `UserPromptSubmit` hook that returned both a
+`systemMessage` and a `hookSpecificOutput.additionalContext` put only the latter in the rollout, as
+a `developer` message. And every escape in it is dropped: a segment sent with SGR colours came out
+as its plain characters with the block glyphs intact, which is why `render` takes a `plain` flag
+rather than being trusted to look right. A cost meter must not pay tokens to display a cost, so
+`additionalContext` is the wrong half of that pair and is never used.
+
+The price of that surface is the refresh: codex renders when a hook fires, not once a second.
+`RTC_CODEX_RENDER` (default `submit,stop`) names the events, and `setup` wires only those — a hook
+that would render nothing is a process per tool call for no reason, so changing the variable means
+running setup again. `submit` still arrives before the request is sent, so the forward-looking
+figure survives; what does not survive is watching it move while you type.
+
+**Codex will not run a hook it has not been shown.** The command line is hashed into
+`[hooks.state]` in `config.toml`, keyed `<file>:<event_snake>:<group>:<index>`, and an unreviewed
+hook is skipped in `codex exec` with no message at all — from outside that is indistinguishable
+from a broken one, which is why doctor counts the trust entries. The user clears it once with
+`/hooks` then `t`. The hash is not reproducible from the command string by any obvious recipe (it
+is not sha256 of the command, of event+command, or of the handler JSON — all tried), so setup
+cannot pre-trust and does not pretend to. It says the two keystrokes instead.
 
 **Hook payloads carry neither cost nor context.** `cost.total_cost_usd` and `context_window` are
 handed to the statusline and to nothing else. The request to expose context usage to hooks
@@ -36,6 +69,36 @@ times a rate is a price. Rates have three tiers, strict order: `RTC_PRICE_<model
 `share/prices.tsv`. A model with no rate anywhere gets gauge and warnings only; a half-shown money
 display is worse than none. Kimi publishes no cache TTL, so there the estimate never shows the
 expiring/cold countdown.
+
+**Codex reports tokens, never dollars, and the rollout is the wire.** The hook payload names the
+session's `transcript_path` — `$CODEX_HOME/sessions/<y>/<m>/<d>/rollout-<ts>-<id>.jsonl` — and that
+file carries one `event_msg` / `token_count` record per request. `info.last_token_usage` is the
+request; `info.total_token_usage` is the session so far; `info.model_context_window` is the window.
+Tail the first, never sum it with the second. `last_token_usage.input_tokens` **already contains**
+`cached_input_tokens` and `cache_write_input_tokens`, so the plain-input term is what remains after
+both are taken out of it — measured on a live session, where request two reported 19,845 input of
+which 19,840 were cached.
+
+The model is not on the usage record. It is on the `turn_context` records interleaved with them,
+one per turn, and it changes when the user switches model mid-session — so the tailer carries the
+last-seen model forward and prices each row by the model its own `turn_context` names, exactly as
+the Kimi subagent pass does. The hook payload also carries `model` on every event, which is the
+better answer when a chunk opens before its first `turn_context`; the session's last one is kept in
+an `rtc-codex-<id>.model` sidecar for the same reason the Kimi wire alias is.
+
+A custom provider is the point of this rather than an edge of it: `model_provider` in
+`config.toml` is what makes `deepseek-v4-pro` cost what DeepSeek charges. `rates` takes that
+provider as the preference hint, so the first-party entry wins over the two dozen gateways
+models.dev lists the same id under — measured, `deepseek/deepseek-v4-pro` at $0.435/M in against
+`cortecs` at $1.73/M for the same name. With no provider configured the hint is `openai`.
+
+Verified end to end on a live DeepSeek session: rtc's running total and an independent `jq` sum
+over every `token_count` row in the rollout both give $0.000151.
+
+Codex publishes no prompt-cache TTL either, so the estimate there shows the warm figure with no
+expiry countdown, the same as Kimi. No codex model is in `share/prices.tsv`: `setup` fetches rates
+at install and the render path refreshes them, so a seed would only be a second thing to keep
+current.
 
 **Never let a shipped price outrank a measured or fetched one.** The CLI has a price table compiled
 in (`inputTokens:5, outputTokens:25, promptCacheWriteTokens:6.25, promptCacheWrite1hTokens:10,
@@ -162,15 +225,23 @@ re-fetch a plugin whose version has not moved. A fix left at the same version si
 has already happened once.
 
 **Platform is detected from the payload, never configured.** A statusline payload with `sessionId`
-(camelCase) is Kimi; `session_id` (snake) is Claude. A hook payload with `hook_event_name` is Kimi.
-Kimi hook stdout must be plain text (it is appended to context verbatim); Claude wants
-`{"systemMessage": ...}` JSON. Kimi session files are prefixed `rtc-kimi-` so state never collides
-and `doctor` can tell them apart.
+(camelCase) is Kimi; `session_id` (snake) is Claude. A hook payload with `hook_event_name` is Kimi
+**or** codex, and the discriminator is `transcript_path`: codex hands one over on every event and
+Kimi hands over nothing but the session id. Kimi hook stdout must be plain text (it is appended to
+context verbatim); Claude and codex want `{"systemMessage": ...}` JSON. Session files are prefixed
+`rtc-kimi-` and `rtc-codex-` so state never collides and `doctor` can tell them apart.
+
+Codex hook payloads are otherwise Claude-shaped and then some: `session_id`, `transcript_path`,
+`cwd`, `hook_event_name`, plus `model` and `permission_mode` on every event, `turn_id` on anything
+inside a turn, and the usual `tool_name` / `tool_input` / `tool_response` / `prompt` /
+`last_assistant_message`. The events are `SessionStart`, `UserPromptSubmit`, `PreToolUse`,
+`PermissionRequest`, `PostToolUse`, `SubagentStart`, `SubagentStop`, `PreCompact`, `PostCompact`,
+`Stop`, `SessionEnd`. `SessionEnd` has its timeout clamped to 3s whatever the file says.
 
 ## Layout
 
 ```
-bin/rtc                      everything — one bash script, seven subcommands
+bin/rtc                      everything — one bash script, eight subcommands
 hooks/hooks.json             Claude: UserPromptSubmit -> rtc hook; Stop, Notification -> rtc halt
 kimi.plugin.json             Kimi plugin manifest: same three hooks, ./kimi/commands/
 commands/setup.md            /realtokencost:setup (Claude)
@@ -186,9 +257,19 @@ drive/lib.sh                 the scratch world each drive runs in, and the secon
 .claude-plugin/marketplace.json   single-plugin marketplace, source "./"
 ```
 
+Codex has no manifest here: it declares hooks in `$CODEX_HOME/hooks.json`, which only `setup`
+writes and only `uninstall` unwrites. Codex does read `.codex-plugin/plugin.json` and
+`.claude-plugin/plugin.json` as Agent Plugins manifests
+(`https://agent-plugins.org/schemas/1.0.0/plugin.schema.json`), and a manifest can declare hooks —
+whether a plugin-declared hook still needs the `/hooks` trust step has not been tested, and the
+`plugin_hooks` feature flag reads `removed`. The hooks.json route is measured and works; the
+plugin route is unexplored.
+
 `rtc statusline` is what the status line command runs (`statusLine.command` on Claude,
-`[status_line].command` on Kimi). `rtc hook`, `halt`, `setup`, `uninstall`, `rates`, `doctor` are
-the rest. `rates` fetches what models.dev publishes into
+`[status_line].command` on Kimi). `rtc codex` is what every codex hook runs — one entry, branching
+on `hook_event_name`, because there is nothing to render into between hooks. `rtc hook`, `halt`,
+`setup`, `uninstall`, `rates`, `doctor` are the rest. `hook` and `halt` recognise a codex payload
+and hand it to `codex`, so a hand-wired install still works. `rates` fetches what models.dev publishes into
 `$XDG_CACHE_HOME/realtokencost/price-<model>` — the Kimi money source alongside `RTC_PRICE_*`. It
 takes its roster from two places, and needs both: the `[models.*]` tables in Kimi's `config.toml`,
 and every alias a live wire has actually reported, read off the `.wire` and `.subs` sidecars.
@@ -211,8 +292,8 @@ rather than `-newermt`, which is a GNU spelling that silently returns nothing un
 
 ## Runtime state
 
-Per session under `$XDG_RUNTIME_DIR` (falling back to `TMPDIR`), keyed by `session_id`. Kimi
-sessions use the same files with an `rtc-kimi-` prefix instead of `rtc-`:
+Per session under `$XDG_RUNTIME_DIR` (falling back to `TMPDIR`), keyed by `session_id`. Kimi and
+codex sessions use the same files with an `rtc-kimi-` or `rtc-codex-` prefix instead of `rtc-`:
 
 | file | holds |
 |---|---|
@@ -226,6 +307,7 @@ sessions use the same files with an `rtc-kimi-` prefix instead of `rtc-`:
 | `rtc-<id>.nudged` | set once when told to run setup |
 | `rtc-kimi-<id>.wire` | Kimi only: wire.jsonl path on line 1, model alias on line 2 |
 | `rtc-kimi-<id>.subs` | Kimi only: one line per subagent wire — `agent-N offset alias` |
+| `rtc-codex-<id>.model` | Codex only: the model the rollout last named |
 
 State field order, positional, read with one `read`:
 
@@ -233,7 +315,10 @@ State field order, positional, read with one `read`:
 cost pending ring_ts shown shown_ts prev_prompt turn_cost turn_ctx last_call ttl ring_acc woffset sacc
 ```
 
-`woffset` is the Kimi wire.jsonl byte offset; 0 on Claude. On Kimi `cost` is not host-reported —
+`woffset` is the Kimi wire.jsonl byte offset, and the codex rollout byte offset; 0 on Claude. On
+codex it starts at **-1**, not 0, in a session with no state file: 0 reads as "seen, and empty",
+which prices a resumed session's whole history as though it had just been spent. On Kimi `cost` is
+not host-reported —
 it is the running total rtc maintains by pricing new `usage.record` rows, and a first sight of a
 wire adopts its current size as the offset rather than announcing history (the same rule as a first
 cost sighting). The wire path lives in a side file, not the state file, because paths can contain
@@ -317,6 +402,11 @@ so no field can contain a space and the whole file parses with `read`.
 
 Do not "fix" these. Each was tried or considered and rejected for a reason.
 
+**A codex status line.** There is no slot; see the constraint above for the item list and where to
+re-read it out of the binary. Do not go looking for a `command` entry — `/statusline` is a checkbox
+list. If codex ever grows one, `cmd_codex` is where the measurement already lives and only the
+delivery would move.
+
 **OpenCode support.** It has no statusline-command integration point — the SolidJS status bar has no
 user slot, and the request for one
 ([anomalyco/opencode#30295](https://github.com/anomalyco/opencode/issues/30295)) is open. The plugin
@@ -344,13 +434,30 @@ estimate from.
 dozen live sessions, every render arrived on the `refreshInterval` timer; keystrokes produced none.
 The busiest session showed 7 sub-second gaps in 112, all tool activity.
 
-**Ringing from the `Stop` hook itself.** It looks like an obvious simplification and it announces
-nothing. No hook payload carries cost, so the money would have to come from the state file, and at
-the instant `Stop` fires the statusline has not been re-run with the completed request's cost in it.
+**Codex subagent spend.** Codex has `SubagentStart` / `SubagentStop` hooks and a `multi_agent`
+feature, and no session on this machine has ever used them, so whether a child's tokens reach the
+parent rollout's `token_count` rows is **unmeasured**. Nothing is claimed about it and nothing is
+counted for it. The check is one live multi-agent turn: run it, then compare rtc's total against a
+`jq` sum over every `token_count` row in every rollout the turn wrote. Until that is run, treat a
+codex total on a delegating session as a floor.
+
+**A codex price seed.** `setup` fetches rates as its last act and the render path refreshes them,
+so a seeded codex model would be a second table to keep current for no window of usefulness. Kimi
+needs one because its setup cannot always reach a rate; codex's can.
+
+**Ringing from the `Stop` hook itself — on Claude.** It looks like an obvious simplification and it
+announces nothing. No Claude hook payload carries cost, so the money would have to come from the
+state file, and at the instant `Stop` fires the statusline has not been re-run with the completed
+request's cost in it.
 On a one-request turn that request is the whole spend, and the hook would read zero. So the hook
 leaves a marker and the next render rings, with the real number. That render arrives: idle sessions
 keep rendering on the `refreshInterval` timer — checked across two dozen at once, every `.state` file
 had been rewritten within the last second while the `.line` caches beside them were minutes old.
+
+Codex is the exception that shows what the rule is about. There it *does* ring from `Stop`, because
+the hook reads the rollout itself and by `Stop` the completed request is already a row in it — and
+because there is no later render to defer to, nothing runs between hooks. So on codex `Stop`
+measures, rings and writes state in one pass, and no `.halt` marker is ever created.
 
 **Averaging the estimate.** It takes the cheapest observed ratio, not a mean or median. A minimum
 cannot be dragged up by a tool-heavy turn or by a $3 cache rebuild, which is the whole point.
@@ -494,7 +601,14 @@ drive-concurrent  ten sessions on one shared ring, and a subagent writing its wi
                   renders land on it
 drive-real        a real session off this machine, replayed from byte 0, then again with a
                   second real model on one of its subagents
+drive-codex       the rollout tailer: adoption, per-row pricing across a model switch,
+                  partial lines, rotation, the plain render, the band, the ring at Stop,
+                  a custom provider outranking a reseller, and hooks.json round trips
 ```
+
+Every drive points `CLAUDE_CONFIG_DIR`, `KIMI_CODE_HOME` and `CODEX_HOME` at directories that do
+not exist unless the drive makes them. That is not belt and braces: a drive that called `setup`
+with `CLAUDE_CONFIG_DIR` unset took the statusline off this machine.
 
 The three platforms it runs them on are `native`, the macOS-shaped `PATH` from `drive/mkshim.sh`,
 and bash 3.2.57 in a container — see the macOS constraint above for why both simulated halves are
@@ -510,8 +624,30 @@ outright is caught on about the third run of the ten-way drive and not the first
 deletes is a certainty and what it leaves is a race; that mutant asks for eight runs and reports
 which one caught it, rather than being quietly dropped for being awkward.
 
-Two things the drives cannot reach, so they were driven by hand and are worth repeating by hand
-after any change to the wire tailer. Watching a live Kimi session: `kimi -p '…'` in a scratch
+The codex drive is a synthetic rollout plus real hook payloads on stdin — everything is in the
+JSON, and `transcript_path` is just a file you append to:
+
+```bash
+printf '{"session_id":"t","transcript_path":"/tmp/r.jsonl","cwd":"/tmp",
+"hook_event_name":"UserPromptSubmit","model":"deepseek-v4-pro","turn_id":"t1"}' |
+  RTC_MUTE=1 RTC_PRICE_deepseek_v4_pro="1 0.1 1 4" bin/rtc codex
+```
+
+```bash
+printf '%s\n' '{"type":"turn_context","payload":{"model":"deepseek-v4-pro"}}' >> /tmp/r.jsonl
+printf '%s\n' '{"type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":
+{"input_tokens":40000,"cached_input_tokens":20000,"cache_write_input_tokens":0,"output_tokens":300,
+"total_tokens":40300},"model_context_window":400000}}}' >> /tmp/r.jsonl   # then fire again
+```
+
+Three things the drives cannot reach, so they were driven by hand and are worth repeating by hand
+after any change to the wire or rollout tailers.
+
+Watching a live codex session needs the TUI, because `codex exec` never renders a `systemMessage`.
+Drive it through a pty: answer the directory-trust prompt, answer the hooks-review prompt with `t`,
+then type a prompt. That is how the plain-render rule and the `additionalContext`-costs-tokens rule
+were both established, and how the live total was checked — rtc's figure and a `jq` sum over the
+rollout agreed to the microdollar. Watching a live Kimi session: `kimi -p '…'` in a scratch
 directory with a one-second render loop pointed at the session it creates (`-p` refuses to combine
 with `-y` or `--auto`; it needs neither). The wire of a subagent spawned mid-session appears between
 two renders and is counted from byte 0, which is the rule that is easiest to get backwards.
@@ -586,6 +722,8 @@ claude plugin install realtokencost@realtokencost
 "$(ls -d ~/.claude/plugins/cache/realtokencost/realtokencost/*/ | sort -V | tail -1)bin/rtc" setup
 # kimi: /plugins install https://github.com/api-haus/realtokencost (reinstalls the managed copy),
 # then setup from it the same way; /reload-tui picks up tui.toml without a restart
+# codex: rtc setup writes ~/.codex/hooks.json — then start codex, /hooks, press t, because
+# the trust hash covers the command line and a version bump changes the path in it
 ```
 
 `setup` must be re-run after every install: it writes an absolute versioned path into `statusLine`,

@@ -2,7 +2,7 @@
 
 **What the context in front of you actually costs — before you press enter.**
 
-A statusline segment and hook for Claude Code and Kimi Code. `rtc` for short.
+A statusline segment and hook for Claude Code, Kimi Code and OpenAI Codex. `rtc` for short.
 
 ```
 Opus 5  xhigh  █░░░░░░░░░ 18%  182k / 1.00M  $9.76  [~$0.18]  +$0.03
@@ -132,6 +132,49 @@ Kimi subagents inherit the model you are talking to, so while every row is price
 row names, a session mixing two of them is a case that has been built and checked rather than seen
 in the wild.
 
+### OpenAI Codex
+
+Codex is supported, with one difference you should know before installing, because it is not a
+limitation of rtc: **codex has no status line command slot.** `[tui].status_line` is a checkbox list
+over built-in items — `model-with-reasoning`, `context-remaining`, `used-tokens` and so on — with no
+custom entry and no plugin hook. There is nothing to claim.
+
+So on codex the segment arrives as a hook message instead: the TUI prints it, and the model never
+sees it, so it costs no tokens. You get the same line, on two beats per turn rather than once a
+second.
+
+```bash
+git clone https://github.com/api-haus/realtokencost && realtokencost/bin/rtc setup
+```
+
+Then start codex, run `/hooks`, and press `t`. Codex refuses to run a hook whose command line it has
+not been shown, and it skips an unreviewed one silently — so this step is not optional, and it comes
+back whenever the path changes. `rtc doctor` tells you if it is outstanding.
+
+```
+[submit]  deepseek-v4-pro  █░░░░░░░░░ 16%  164k / 996k  $2.14  [~$0.18]
+[stop]    deepseek-v4-pro  █░░░░░░░░░ 17%  169k / 996k  $2.35   +$0.21
+```
+
+`RTC_CODEX_RENDER` picks the beats: `submit,stop` by default, or add `tool` for a line after every
+tool call, or drop one you do not want. Setup wires only the events you name, so change it and run
+setup again.
+
+**Custom models and custom providers are the normal case here, not the exception.** Codex reports
+tokens and never dollars, so rtc prices them itself, reading the per-request usage out of the
+session rollout and taking the model from the rollout turn by turn — so switching model mid-session
+prices each request at what that request actually ran on. Rates come from `model_provider` in your
+`config.toml`, which is what makes DeepSeek cost what DeepSeek charges: point codex at
+`api.deepseek.com` and `rtc rates` fetches `deepseek/deepseek-v4-pro` at $0.435/M in rather than one
+of the two dozen resellers listing the same name at four times that. Switch back to ChatGPT and the
+same machinery prices `gpt-5.x` from OpenAI. A model with no published rate gets the gauge and the
+warnings but no money display, and `rtc doctor` prints the `RTC_PRICE_…` line that fixes it.
+
+Two honest gaps here too. Codex publishes no prompt-cache TTL, so the estimate shows the warm figure
+with no expiry countdown. And codex subagents are **not** counted: no session on this machine has
+ever used `multi_agent`, so whether a child's tokens reach the parent rollout is untested, and rtc
+claims nothing it has not measured. On a delegating codex session, read the total as a floor.
+
 OpenCode is not supported yet: it has no statusline-command integration point
 ([opencode#30295](https://github.com/anomalyco/opencode/issues/30295)). When one lands, rtc's
 platform layer is where it goes.
@@ -179,9 +222,10 @@ shell.
 | `RTC_SOUND` | bundled | path to your own wav |
 | `RTC_VOLUME` | `0.8` | loudness, `0`-`1`; `aplay` has no per-call gain and ignores it |
 | `RTC_MUTE` | `0` | `1` keeps the number, drops the sound |
-| `RTC_PRICE_<model>` | — | Kimi only: `input cache_read cache_write output` in $/M. Beats the cache and the seed |
-| `RTC_RATES_MAX_AGE_DAYS` | `30` | Kimi price cache older than this self-refreshes on the next render |
+| `RTC_PRICE_<model>` | — | Kimi and codex: `input cache_read cache_write output` in $/M. Beats the cache and the seed |
+| `RTC_RATES_MAX_AGE_DAYS` | `30` | price cache older than this self-refreshes on the next render |
 | `RTC_RATES_REFRESH` | `1` | `0` disables that auto-refresh |
+| `RTC_CODEX_RENDER` | `submit,stop` | codex only: which hook events print a line — `submit`, `tool`, `stop`. Setup wires only these, so re-run it after a change |
 
 ## When it rings
 
@@ -332,11 +376,20 @@ The percentage is recomputed from raw token counts rather than taken from `used_
 rounded to a whole number — one point is 10k tokens on a 1M window. It truncates rather than rounds,
 so the figure never overstates and always agrees with the bar beside it.
 
+Kimi and codex are the same shape with the money the other way round. Neither reports a dollar, and
+both record exact per-request token usage — Kimi in the session's `wire.jsonl`, codex in the session
+rollout the hook payload names. rtc tails that file from a saved byte offset, prices the new rows by
+the model each row names, and everything downstream — the float, the ring, the estimate — works
+unchanged. On codex there is no per-second slot to render into, so the same code runs from the hooks
+and rings from `Stop`, which is safe there precisely because the hook reads the completed request out
+of the rollout rather than waiting for a render that is never coming.
+
 ## Requirements
 
 - `jq`
 - an audio player: `pw-play`, `paplay`, `aplay` (Linux) or `afplay` (macOS)
-- Claude Code ≥ 2.1.97 for `refreshInterval`, and/or Kimi Code ≥ 0.30 for `[status_line].command`
+- Claude Code ≥ 2.1.97 for `refreshInterval`, Kimi Code ≥ 0.30 for `[status_line].command`, and/or
+  Codex ≥ 0.147 for lifecycle hooks. `curl` too, if you want prices fetched rather than set by hand.
 
 Developed on Linux. macOS is exercised in two halves rather than on a Mac — a BSD-shaped `PATH` with
 no `setsid` and no `tac`, and bash 3.2.57, which is still what `/bin/bash` is there. Both halves run

@@ -16,6 +16,10 @@ Report what the two commands printed. If a previous statusline was found it is n
 than replaced, so say which one. Tell the user to restart Claude Code, since `statusLine` is read at
 startup.
 
+Setup wires every CLI it finds, so if it reported a codex section, say that codex needs one more
+step before its hooks will run at all: start codex, run `/hooks`, press `t`. Codex skips a hook it
+has not been shown without saying anything, and it asks again whenever the command line changes.
+
 If the doctor reports a missing dependency, say which and how to install it — `jq` is required, and
 an audio player (`pw-play`, `paplay`, `aplay`, or `afplay`) is needed for the sound. Neither is
 bundled.

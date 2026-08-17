@@ -92,6 +92,30 @@ mutant 'a subagent wire is never tailed at all' drive-real \
   '  kimi_subagents "${wire%/main/wire.jsonl}" "$adopt"' \
   '  :'
 
+mutant 'a resumed rollout is priced from byte 0' drive-codex \
+  '  last_call=0; ttl=0; ring_acc=0; woffset=-1; sacc=0' \
+  '  last_call=0; ttl=0; ring_acc=0; woffset=0; sacc=0'
+
+mutant 'codex is sent a segment full of escapes it will drop' drive-codex \
+  '    if (plain != "") { RESET = ""; DIM = "" }' \
+  '    if (0) { RESET = ""; DIM = "" }'
+
+mutant 'a codex row is priced by the session model, not its own' drive-codex \
+  '               price_for "${a//[^A-Za-z0-9._-]/_}" &&' \
+  '               price_for "${model//[^A-Za-z0-9._-]/_}" &&'
+
+mutant 'the cached half is billed twice, as plain input as well' drive-codex \
+  '          | ["U", (($u.input_tokens // 0) - ($u.cached_input_tokens // 0)' \
+  '          | ["U", (($u.input_tokens // 0) - (0 * ($u.cached_input_tokens // 0))'
+
+mutant 'a codex turn ending is not a turn handing back' drive-codex \
+  '    Stop)             halted=1; case ",$CODEX_RENDER," in *,stop,*) show=1 ;; esac ;;' \
+  '    Stop)             halted=0; case ",$CODEX_RENDER," in *,stop,*) show=1 ;; esac ;;'
+
+mutant 'setup adds a second codex hook beside the first' drive-codex \
+  '      .hooks = ((.hooks // {}) | map_values(map(select(($CODEX_MINE) | not))))' \
+  '      .hooks = (.hooks // {})'
+
 mutant 'a non-numeric RTC_VOLUME reaches the player unguarded' drive-ring \
   '  case "$v" in '\'''\''|*[!0-9.]*) v=0.8 ;; esac' \
   '  :'

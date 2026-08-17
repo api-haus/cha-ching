@@ -15,8 +15,11 @@ PASS=0; FAIL=0
 fresh() {                       # fresh <name> — a clean world, exported
   W="$BASE/w-$1"
   rm -rf "$W"; mkdir -p "$W/run" "$W/cache" "$W/config" "$W/kimi/sessions/proj" "$W/player"
+  # Host dirs point where nothing is unless a drive makes it: a drive that ran
+  # setup with CLAUDE_CONFIG_DIR unset took the statusline off this machine.
   export XDG_RUNTIME_DIR="$W/run" XDG_CACHE_HOME="$W/cache" \
-         XDG_CONFIG_HOME="$W/config" KIMI_CODE_HOME="$W/kimi" \
+         XDG_CONFIG_HOME="$W/config" KIMI_CODE_HOME="$W/kimi" CODEX_HOME="$W/codex" \
+         CLAUDE_CONFIG_DIR="$W/claudeconf" \
          RTC_MUTE="${RTC_MUTE-1}" RTC_RATES_REFRESH="${RTC_RATES_REFRESH-0}" \
          RTC_RING_SCOPE="${RTC_RING_SCOPE-session}"
 

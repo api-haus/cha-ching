@@ -6,7 +6,7 @@ set -u
 cd "$(dirname "$0")"
 name=${1:?platform name}
 rc=0
-for d in drive-kimi drive-claude drive-ring drive-rates drive-concurrent drive-real; do
+for d in drive-kimi drive-claude drive-codex drive-ring drive-rates drive-concurrent drive-real; do
   [ -r "./$d.sh" ] || continue
   out=$(bash "./$d.sh" 2>&1)
   line=$(printf '%s' "$out" | tail -1)
