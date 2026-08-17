@@ -116,6 +116,22 @@ mutant 'setup adds a second codex hook beside the first' drive-codex \
   '      .hooks = ((.hooks // {}) | map_values(map(select(($CODEX_MINE) | not))))' \
   '      .hooks = (.hooks // {})'
 
+mutant 'a two-tier rate is always billed at its peak half' drive-codex \
+  '      v=${v#* * * * }; PRICE_SRC="$PRICE_SRC off-peak"' \
+  '      v=${v% * * * *}; PRICE_SRC="$PRICE_SRC off-peak"'
+
+mutant 'a peak window running past midnight matches nothing' drive-codex \
+  '      { [ "$h" -ge "$from" ] || [ "$h" -lt "$to" ]; } && return 0' \
+  '      [ "$h" -ge "$from" ] && [ "$h" -lt "$to" ] && return 0'
+
+mutant 'a sub-cent total is rounded away to $0.00' drive-codex \
+  '  function money(v) { return (v > 0 && v < 0.01) ? sprintf("%.4f", v) : sprintf("%.2f", v) }' \
+  '  function money(v) { return sprintf("%.2f", v) }'
+
+mutant 'a sub-cent estimate is rounded away to $0.00' drive-codex \
+  '    function money(v) { return (v > 0 && v < 0.01) ? sprintf("%.4f", v) : sprintf("%.2f", v) }' \
+  '    function money(v) { return sprintf("%.2f", v) }'
+
 mutant 'a non-numeric RTC_VOLUME reaches the player unguarded' drive-ring \
   '  case "$v" in '\'''\''|*[!0-9.]*) v=0.8 ;; esac' \
   '  :'

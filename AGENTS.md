@@ -100,6 +100,27 @@ expiry countdown, the same as Kimi. No codex model is in `share/prices.tsv`: `se
 at install and the render path refreshes them, so a seed would only be a second thing to keep
 current.
 
+**models.dev is not right about every provider, and a rate can change by the hour.** Measured
+2026-08-17: models.dev lists `deepseek/deepseek-v4-pro` at input $0.435, cache_read $0.003625,
+output $0.87 per million. DeepSeek's own table publishes cache-miss input $0.66 off-peak / $1.32
+peak, cache hit $0.022 / $0.044, output $1.98 / $3.96, with peak defined as 01:00-04:00 and
+06:00-10:00 UTC and off-peak exactly half. So the fetched number is wrong at every hour of the day
+— low by 1.5× off-peak and 3× at peak — and no single number could be right, because the provider
+charges by the clock.
+
+That is why `RTC_PRICE_<model>` takes **four or eight** rates. Eight is peak four then off-peak
+four, and `RTC_PEAK_<model>` (or a global `RTC_PEAK`) gives the UTC windows the first half applies
+in, `01-04,06-10`. A window written `22-02` runs past midnight and is two intervals; `in_peak`
+handles that, and getting it wrong is a mutant. Four rates behave exactly as they always did.
+`PRICE_SRC` carries the half in force so doctor names it, because a number that halves itself
+overnight looks like a bug the first time you see it.
+
+The hour is arithmetic on the timestamp the render already holds — the epoch is UTC, so
+`(t / 3600) % 24` is the hour and there is no second `date` on the render path.
+
+Only the config tier can be two-tier. The models.dev cache line and the seed both carry four
+fields, and models.dev has no notion of time-banded pricing to fetch.
+
 **Never let a shipped price outrank a measured or fetched one.** The CLI has a price table compiled
 in (`inputTokens:5, outputTokens:25, promptCacheWriteTokens:6.25, promptCacheWrite1hTokens:10,
 promptCacheReadTokens:0.5` per million) and it is exactly what goes stale — Anthropic added the 1-hour
@@ -141,6 +162,13 @@ under a BSD userland rings **zero** times and strands $3 in the shared accumulat
 `readlink -f` only reached macOS in 12.3, and the fallback kept whatever `$0` was — which `setup`
 then writes into `settings.json`, and which `ROOT` (the price seed, the wav) is derived from. It is
 made absolute now.
+
+**Two decimals is the wrong resolution for a cheap model.** A whole DeepSeek turn measured
+$0.004166 on a live session — real money, rendered `$0.00`, which reads as "this is not working".
+So `money()` in `render` and in `estimate` gives four decimals below a cent and two at or above it.
+The Claude case is untouched by construction. Both copies carry their own mutant, because a drive
+that only matches `$0.0xxx` anywhere in the line is satisfied by the estimate and passes a broken
+total — which is what the first version of that assertion did.
 
 **`LC_ALL=C` at the top of the script is load-bearing.** Money and percentages are text all the way
 through. Under a comma-decimal locale `awk` and `printf` disagree about what `9.76` means and the

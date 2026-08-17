@@ -174,6 +174,46 @@ out=$(RTC_CODEX_RENDER=submit,tool,stop xpay PostToolUse gpt-5.4 t7 | RTC_CODEX_
 case "$out" in *systemMessage*) ok '  and renders when it does' ;;
   *) bad '  and renders when it does' 'systemMessage' "$out" ;; esac
 
+printf '\n== a provider that charges by the clock ==\n'
+# Nothing fakes the clock: the windows are built around the hour it is now, one
+# containing it and one not. See AGENTS.md for why a rate can have two halves.
+PSESS=xp
+PROLL="$W/roll-peak.jsonl"
+HOUR=$(date -u +%H); HOUR=$((10#$HOUR))
+IN="$HOUR-$(( (HOUR + 1) % 24 ))"
+OUTW="$(( (HOUR + 2) % 24 ))-$(( (HOUR + 3) % 24 ))"
+clocked() {                     # clocked <peak-windows> [rates] -> total after one 1M-token row
+  rm -f "$XDG_RUNTIME_DIR/rtc-codex-$PSESS."*
+  printf '{"timestamp":"x","type":"turn_context","payload":{"model":"clocked"}}\n' > "$PROLL"
+  local pay rates=${2:-"10 1 0 100 5 0.5 0 50"}
+  pay() { printf '{"session_id":"%s","transcript_path":"%s","cwd":"%s","hook_event_name":"%s","model":"clocked","turn_id":"p1"}' \
+    "$PSESS" "$PROLL" "$W" "$1"; }
+  pay SessionStart | RTC_PRICE_clocked="$rates" RTC_PEAK_clocked="$1" "$RTC" codex >/dev/null
+  printf '{"timestamp":"x","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{},"last_token_usage":{"input_tokens":1000000,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":0,"total_tokens":1000000},"model_context_window":400000}},"rate_limits":null}\n' >> "$PROLL"
+  pay Stop | RTC_PRICE_clocked="$rates" RTC_PEAK_clocked="$1" "$RTC" codex >/dev/null
+  cut -d' ' -f1 < "$XDG_RUNTIME_DIR/rtc-codex-$PSESS.state"
+}
+near 'inside a peak window the first four rates apply' 10.000000 "$(clocked "$IN")"
+near 'outside every peak window the second four do' 5.000000 "$(clocked "$OUTW")"
+near 'and four rates alone still mean one price at every hour' 10.000000 \
+  "$(clocked "$OUTW" "10 1 0 100")"
+# Two windows, because a wrapping one containing this hour only exists away
+# from midnight and a fixed 23-1 only wraps onto it. Between them every hour
+# puts the wrap branch under an assertion.
+near 'a window running past midnight is one window, not none' 10.000000 \
+  "$(clocked "$HOUR-$(( (HOUR + 23) % 24 ))")"
+case "$HOUR" in 0|23) midnight=10.000000 ;; *) midnight=5.000000 ;; esac
+near '  and the hours it does not reach stay off-peak' "$midnight" "$(clocked '23-1')"
+
+printf '\n== money smaller than a cent ==\n'
+sub=$(clocked "$OUTW" "0.004 0 0 0" >/dev/null; \
+  printf '{"session_id":"%s","transcript_path":"%s","cwd":"%s","hook_event_name":"UserPromptSubmit","model":"clocked","turn_id":"p2"}' \
+    "$PSESS" "$PROLL" "$W" | RTC_PRICE_clocked="0.004 0 0 0" "$RTC" codex | jq -r '.systemMessage')
+if printf '%s' "$sub" | grep -qE ' \$0\.0[0-9]{3}'; then ok 'a sub-cent total keeps four decimals instead of reading zero'
+else bad 'a sub-cent total keeps four decimals instead of reading zero' ' $0.0xxx' "$sub"; fi
+if printf '%s' "$sub" | grep -qE '~\$0\.0[0-9]{3}'; then ok '  and so does the estimate beside it'
+else bad '  and so does the estimate beside it' '~$0.0xxx' "$sub"; fi
+
 printf '\n== a custom provider is priced as its own ==\n'
 cat > "$W/codex/config.toml" <<'EOF'
 model = "deepseek-v4-pro"

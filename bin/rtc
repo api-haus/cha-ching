@@ -257,9 +257,34 @@ ring_lock() {
 #
 # Returns via globals, not stdout, so the source tier survives the call:
 # PRICE holds the four rates, PRICE_SRC names the tier (override/cache/seed).
+# Whether the clock is inside one of a model's peak windows, "01-04,06-10" in
+# UTC hours. DeepSeek halves its rates outside them, so one number per model is
+# wrong at some hour of every day. The epoch is UTC, so the hour is arithmetic
+# on a timestamp the render already has — never a second `date`.
+in_peak() {                     # in_peak <windows>
+  local t=${now:-} h from to w
+  case "$t" in ''|*[!0-9.]*) t=$(date +%s 2>/dev/null) ;; esac
+  case "$t" in ''|*[!0-9.]*) return 0 ;; esac
+  h=$(( (${t%.*} / 3600) % 24 ))
+  local IFS=,
+  for w in $1; do
+    from=${w%-*}; to=${w#*-}
+    case "$from$to" in ''|*[!0-9]*) continue ;; esac
+    # A window that runs past midnight is written "22-02" and is two intervals.
+    if [ "$from" -le "$to" ]; then
+      [ "$h" -ge "$from" ] && [ "$h" -lt "$to" ] && return 0
+    else
+      { [ "$h" -ge "$from" ] || [ "$h" -lt "$to" ]; } && return 0
+    fi
+  done
+  return 1
+}
+
 price_for() {
   PRICE=""; PRICE_SRC=""
-  local key="RTC_PRICE_$(printf '%s' "$1" | tr -c 'A-Za-z0-9_' '_')" v=""
+  local m="$1" san
+  san=$(printf '%s' "$1" | tr -c 'A-Za-z0-9_' '_')
+  local key="RTC_PRICE_$san" v=""
   v=${!key:-}
   if [ -n "$v" ]; then PRICE_SRC=override
   elif [ -r "$CACHE_DIR/price-$1" ]; then
@@ -280,8 +305,19 @@ price_for() {
       fi
     done < "$ROOT/share/prices.tsv" 2>/dev/null
   fi
-  [ "$(printf '%s' "$v" | wc -w)" = 4 ] || return 1
   case "$v" in ''|*[!0-9.\ ]*) return 1 ;; esac
+  # Eight rates is a provider that charges by the clock: peak four, off-peak
+  # four. Split with parameter expansion — this is the render path.
+  if [ "$(printf '%s' "$v" | wc -w)" = 8 ]; then
+    local win="RTC_PEAK_$san"
+    win=${!win:-${RTC_PEAK:-}}
+    if [ -n "$win" ] && ! in_peak "$win"; then
+      v=${v#* * * * }; PRICE_SRC="$PRICE_SRC off-peak"
+    else
+      v=${v% * * * *}; PRICE_SRC="$PRICE_SRC peak"
+    fi
+  fi
+  [ "$(printf '%s' "$v" | wc -w)" = 4 ] || return 1
   PRICE=$v
 }
 
@@ -993,6 +1029,7 @@ estimate() {
   [ -r "$turns" ] || return 1
   [ "${ctx:-0}" -gt 0 ] || return 1
   awk -v ctx="$ctx" -v coldf="$cold" -v lc="$last_call" -v ttl="$ttl" -v now="$now" '
+    function money(v) { return (v > 0 && v < 0.01) ? sprintf("%.4f", v) : sprintf("%.2f", v) }
     { if (n == 0 || $1 + 0 < lo) lo = $1 + 0; n++ }
     END {
       if (n < 1 || lo <= 0) exit 1
@@ -1005,12 +1042,12 @@ estimate() {
       close(coldf)
       cold = (cr > 0) ? cr * (ctx / 1000000) : warm * (ttl >= 3600 ? 20 : 12.5)
 
-      if (lc + 0 <= 0 || ttl + 0 <= 0) { printf "%.2f warm 0 %d", warm, n; exit }
+      if (lc + 0 <= 0 || ttl + 0 <= 0) { printf "%s warm 0 %d", money(warm), n; exit }
 
       left = ttl - (now - lc)
-      if      (left <= 0)  printf "%.2f cold 0 %d", cold, n
-      else if (left < 300) printf "%.2f expiring %d %d", warm, left, n
-      else                 printf "%.2f warm %d %d", warm, left, n
+      if      (left <= 0)  printf "%s cold 0 %d", money(cold), n
+      else if (left < 300) printf "%s expiring %d %d", money(warm), left, n
+      else                 printf "%s warm %d %d", money(warm), left, n
     }' "$turns"
 }
 
@@ -1018,6 +1055,9 @@ render() {
   awk -v model="$1" -v effort="$2" -v used="$3" -v size="$4" -v cost="$5" \
       -v delta="$6" -v dts="$7" -v now="$8" -v est="$9" -v plain="${10:-}" -v fade="$FADE" '
   function scale(n) { return n >= 1000000 ? sprintf("%.2fM", n/1000000) : sprintf("%.0fk", n/1000) }
+  # Two decimals reads as $0.00 for a whole session on a cheap model — a
+  # DeepSeek turn is a third of a cent. Sub-cent money gets four.
+  function money(v) { return (v > 0 && v < 0.01) ? sprintf("%.4f", v) : sprintf("%.2f", v) }
   # Codex renders a hook systemMessage as plain text and drops every escape in
   # it, so the same line has to be able to come out without any.
   function rgb(r, g, b) { return plain != "" ? "" : sprintf("\033[38;2;%d;%d;%dm", r, g, b) }
@@ -1042,7 +1082,7 @@ render() {
     }
     # A negative cost is the noprice signal (Kimi model with no rate): the
     # gauge renders, everything about money stays out.
-    if (cost + 0 >= 0) out = out sprintf(" %s$%.2f%s", DIM, cost, RESET)
+    if (cost + 0 >= 0) out = out sprintf(" %s$%s%s", DIM, money(cost), RESET)
 
     # What the next message is likely to cost, before it is sent. Dim while a
     # single turn is carrying the whole guess; full blue once the median has
@@ -1068,7 +1108,7 @@ render() {
       t = age / fade
       k = t < 0.15 ? 0 : (t - 0.15) / 0.85     # holds bright for a beat, then falls
       bold = (t < 0.15 && plain == "") ? "\033[1m" : ""
-      out = out sprintf("  %s%s+$%.2f%s", bold, rgb(134 + (26-134)*k, 239 + (48-239)*k, 172 + (36-172)*k), delta, RESET)
+      out = out sprintf("  %s%s+$%s%s", bold, rgb(134 + (26-134)*k, 239 + (48-239)*k, 172 + (36-172)*k), money(delta), RESET)
     }
     printf "%s", out
   }'
@@ -1772,6 +1812,13 @@ cmd_doctor() {
     printf '              measured, not assumed; rtc adds nothing to it\n'
   fi
 
+  # Overrides serve every platform, so they are listed before any of them —
+  # a codex-only machine would never see them from inside the Kimi block.
+  local kc
+  for kc in $(grep -s '^RTC_PRICE_' "$CONFIG" | cut -d= -f1); do
+    printf '  price       %s — config override in %s\n' "${kc#RTC_PRICE_}" "$CONFIG"
+  done
+
   if [ -d "$KIMI_HOME" ]; then
     local kwired
     kwired=$(kimi_tui_command)
@@ -1797,9 +1844,6 @@ cmd_doctor() {
     # is a silent money display — say where every known rate came from and
     # which live model has none.
     local kc
-    for kc in $(grep -s '^RTC_PRICE_' "$CONFIG" | cut -d= -f1); do
-      printf '  kimi price  %s — config override in %s\n' "${kc#RTC_PRICE_}" "$CONFIG"
-    done
     local pf pm
     for pf in "$CACHE_DIR"/price-*; do
       [ -r "$pf" ] || continue

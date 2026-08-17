@@ -170,6 +170,25 @@ of the two dozen resellers listing the same name at four times that. Switch back
 same machinery prices `gpt-5.x` from OpenAI. A model with no published rate gets the gauge and the
 warnings but no money display, and `rtc doctor` prints the `RTC_PRICE_…` line that fixes it.
 
+**Check the fetched rate against your provider's own table once.** models.dev is the automatic
+source and it is not right about everyone. For `deepseek-v4-pro` on 2026-08-17 it published $0.435/M
+in and $0.87/M out; DeepSeek charges $0.66/$1.98 off-peak and $1.32/$3.96 at peak — so the fetched
+number was low by 1.5× for most of the day and 3× during peak hours. `rtc doctor` names the source
+of every rate it is using; if it disagrees with your bill, state the truth once and it wins forever:
+
+```
+RTC_PRICE_deepseek_v4_pro="1.32 0.044 0 3.96 0.66 0.022 0 1.98"
+RTC_PEAK_deepseek_v4_pro="01-04,06-10"
+```
+
+Eight numbers instead of four is a provider that charges by the clock — peak four, then off-peak
+four — and `RTC_PEAK_<model>` says when the first half applies, in UTC. DeepSeek halves its rates
+outside those two windows, so no single figure is correct at every hour. Doctor prints which half is
+in force right now.
+
+Money below a cent is shown to four decimals rather than two, because a whole DeepSeek turn is a
+third of a cent and `$0.00` reads like a broken tool rather than a cheap one.
+
 Two honest gaps here too. Codex publishes no prompt-cache TTL, so the estimate shows the warm figure
 with no expiry countdown. And codex subagents are **not** counted: no session on this machine has
 ever used `multi_agent`, so whether a child's tokens reach the parent rollout is untested, and rtc
@@ -222,7 +241,8 @@ shell.
 | `RTC_SOUND` | bundled | path to your own wav |
 | `RTC_VOLUME` | `0.8` | loudness, `0`-`1`; `aplay` has no per-call gain and ignores it |
 | `RTC_MUTE` | `0` | `1` keeps the number, drops the sound |
-| `RTC_PRICE_<model>` | — | Kimi and codex: `input cache_read cache_write output` in $/M. Beats the cache and the seed |
+| `RTC_PRICE_<model>` | — | Kimi and codex: `input cache_read cache_write output` in $/M, or eight values for peak-then-off-peak. Beats the cache and the seed |
+| `RTC_PEAK_<model>` | — | UTC windows the first four rates apply in, e.g. `01-04,06-10`; `22-02` runs past midnight. `RTC_PEAK` sets a default for every model |
 | `RTC_RATES_MAX_AGE_DAYS` | `30` | price cache older than this self-refreshes on the next render |
 | `RTC_RATES_REFRESH` | `1` | `0` disables that auto-refresh |
 | `RTC_CODEX_RENDER` | `submit,stop` | codex only: which hook events print a line — `submit`, `tool`, `stop`. Setup wires only these, so re-run it after a change |
