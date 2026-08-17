@@ -1313,6 +1313,9 @@ cmd_setup() {
   if [ -d "$KIMI_HOME" ]; then setup_kimi; did=1; fi
   if [ -d "$CODEX_DIR" ]; then setup_codex; did=1; fi
   [ "$did" = 1 ] || die "found none of $SETTINGS, $KIMI_HOME or $CODEX_DIR — is a supported CLI installed?"
+  # Once for the machine, not once per platform: the roster is shared and the
+  # fetch is a download.
+  case "$did" in 1) [ -d "$KIMI_HOME" ] || [ -d "$CODEX_DIR" ] && { cmd_rates || true; } ;; esac
 }
 
 # Which events setup wires into codex. A hook that would render nothing is a
@@ -1349,7 +1352,6 @@ setup_codex() {
   printf '  /hooks, press t. It asks again every time the command line changes.\n'
   printf '  codex has no status line command slot, so the segment arrives as a\n'
   printf '  hook systemMessage — RTC_CODEX_RENDER=%s decides on which events.\n' "$CODEX_RENDER"
-  cmd_rates || true
 }
 
 # Never chain to ourselves, under any name we have ever had. Re-running setup,
@@ -1471,7 +1473,6 @@ EOF
   esac
 
   printf '  run /reload-tui (or restart Kimi Code) to pick up the status line.\n'
-  cmd_rates || true
 }
 
 # One "alias<TAB>model id" line, unless the alias already has one. There is no
